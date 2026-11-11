@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,17 @@ def codex_command():
     return [shutil.which('codex') or 'codex']
 
 
+def prepare_skills(repo, runner, source, revision, *, checkout_existing):
+    skills = repo.home / 'agent-skills'
+    if not skills.exists():
+        runner.run(['git', 'clone', source, str(skills)], repo.root, 600)
+        checkout_existing = True
+    if checkout_existing:
+        runner.run(['git', 'checkout', '--detach', revision], skills, 120)
+    commit = runner.run(['git', 'rev-parse', 'HEAD'], skills, 120)['stdout'].strip()
+    return str(skills.resolve()), commit
+
+
 def initialize(args, repo, runner):
     config_path = repo.home / 'config.json'
     if config_path.exists():
@@ -43,14 +55,10 @@ def initialize(args, repo, runner):
     branch = args.target_branch or repo.git('symbolic-ref', '--short', 'HEAD')
     repo.require_clean(branch)
     repo.home.mkdir(parents=True, exist_ok=True)
-    skills = repo.home / 'agent-skills'
-    if not skills.exists():
-        runner.run(['git', 'clone', args.skills_source, str(skills)], repo.root, 600)
-    runner.run(['git', 'checkout', '--detach', args.skills_revision], skills, 120)
-    commit = runner.run(['git', 'rev-parse', 'HEAD'], skills, 120)['stdout'].strip()
+    skills_path, commit = prepare_skills(repo, runner, args.skills_source, args.skills_revision, checkout_existing=True)
     app_id = args.app_id or re.sub('[^a-z0-9]+', '-', repo.root.name.casefold()).strip('-')[:50] or 'application'
     cfg = Config(app_id=app_id, target_branch=branch, codex=codex_command(),
-                 skills_path=str(skills.resolve()), skills_commit=commit)
+                 skills_path=skills_path, skills_commit=commit)
     cfg.jira.update(base_url=args.jira_url, project=args.project, board_id=args.board_id,
                     priorities=args.priority_ids.split(','))
     cfg.jira['issue_types'] = {'bug': args.bug_type, 'improvement': args.improvement_type, 'feature': args.feature_type}
@@ -63,9 +71,49 @@ def initialize(args, repo, runner):
           'Fill in Jira mappings/custom fields, export credentials, then run doctor.')
 
 
+def launcher_config(path):
+    try:
+        settings = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        settings = {}
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f'Cannot read launcher settings from {path}.') from exc
+    if not isinstance(settings, dict):
+        raise ConfigError(f'Expected a JSON object in {path}.')
+
+    def setting(name, default):
+        value = settings.get(name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default
+        if not isinstance(value, str):
+            raise ConfigError(f'{name} must be a string in {path}.')
+        return value.strip()
+
+    jira_url = setting('jira_url', 'https://ishussien.atlassian.net').rstrip('/')
+    project = setting('jira_project', 'SCRUM').upper()
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', project):
+        raise ConfigError(f'jira_project must be a Jira project key in {path}.')
+    board = settings.get('jira_board_id')
+    board = '1' if board is None or (isinstance(board, str) and not board.strip()) else str(board).strip()
+    if not re.fullmatch(r'[0-9]{1,10}', board) or not 0 < int(board) <= 2_147_483_647:
+        raise ConfigError(f'jira_board_id must be a positive board ID in {path}.')
+    pin = setting('skills_commit', '')
+    if pin and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', pin):
+        raise ConfigError(f'skills_commit must be a Git commit hash in {path}.')
+
+    cfg = Config(app_id='scrum', skills_commit=pin)
+    cfg.jira.update(base_url=jira_url, project=project, board_id=int(board),
+                    issue_types={'bug': '10003', 'improvement': '10003', 'feature': '10004'},
+                    priorities=['1', '2', '3', '4', '5'],
+                    statuses={'backlog': 'To Do', 'in_progress': 'In Progress', 'done': 'Done'})
+    Jira(cfg).base_url()  # Validate before bootstrapping skills or connecting.
+    return cfg
+
+
 def parser():
     result = argparse.ArgumentParser(description='Review applications, create Jira tickets and locally integrate verified improvements.')
     result.add_argument('--repo', default='.', help='Application repository directory (default: current directory).')
+    result.add_argument('--launcher-settings', type=Path, help='Use setup-scrum.json for the Jira target.')
     commands = result.add_subparsers(dest='command', required=True)
     init = commands.add_parser('init', help='Create config and pin agent-skills; no Jira tickets or source changes.')
     init.add_argument('--app-id')
@@ -112,15 +160,19 @@ def doctor(config, repo, state, jira, agent, runner):
     if repo.git('diff', 'HEAD', '--', cwd=work):
         raise Blocked('Baseline validation modified tracked source.')
     repo.discard_clean_worktree(work)
-    print(json.dumps({**jira_result, 'git': 'OK', 'codex': 'OK', 'skills': config.skills_commit,
-                      'validation': checks}, indent=2))
+    return {**jira_result, 'git': 'OK', 'codex': 'OK', 'skills': config.skills_commit, 'validation': checks}
 
 
 def execute(args):
     runner = Runner()
     repo = Repository(Path(args.repo).resolve(), runner)
+    config = launcher_config(args.launcher_settings) if args.launcher_settings is not None else None
+    home = repo.home
+    if config is not None:
+        target = json.dumps([config.jira[key] for key in ('base_url', 'project', 'board_id')])
+        home = repo.home / 'launcher' / hashlib.sha256(target.encode()).hexdigest()[:24]
     if args.command == 'status':
-        database = repo.home / 'state.db'
+        database = home / 'state.db'
         if not database.exists():
             print('No cycles recorded. Run init, doctor, then run.')
             return 0
@@ -139,17 +191,29 @@ def execute(args):
         return 0
     with RepoLock(repo.home / 'instance.lock'):
         if args.command == 'init':
+            if config is not None:
+                raise ConfigError('Launcher settings are initialized by doctor.')
             initialize(args, repo, runner)
             return 0
-        config = Config.load(repo.home / 'config.json')
-        with State(repo.home / 'state.db') as state:
-            logger = configure_logging(repo.home)
+        if config is None:
+            config = Config.load(repo.home / 'config.json')
+        elif args.command in {'doctor', 'run', 'review'}:
+            config.codex = codex_command()
+            config.skills_path, commit = prepare_skills(repo, runner, SKILLS_URL, config.skills_commit or 'HEAD',
+                                                        checkout_existing=False)
+            config.skills_commit = config.skills_commit or commit
+        with State(home / 'state.db') as state:
+            logger = configure_logging(home)
             runner = Runner(state, logger)
             repo.runner = runner
-            jira, agent = Jira(config), Agent(config, repo.home, runner)
+            jira, agent = Jira(config), Agent(config, home, runner)
             engine = Engine(config, repo, state, jira, agent, runner)
             if args.command == 'doctor':
-                doctor(config, repo, state, jira, agent, runner)
+                result = doctor(config, repo, state, jira, agent, runner)
+                if args.launcher_settings is not None:
+                    result['launcher_settings'] = dict(jira_url=config.jira['base_url'], jira_project=config.jira['project'],
+                                                       jira_board_id=config.jira['board_id'], skills_commit=config.skills_commit)
+                print(json.dumps(result, indent=2))
             elif args.command == 'review':
                 print(json.dumps(engine.review_only(), indent=2))
             elif args.command == 'resolve-create':

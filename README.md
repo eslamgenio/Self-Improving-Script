@@ -31,9 +31,11 @@ uses the account/model configured in your CLI and is subject to its usage limits
 
 ## Set up the SCRUM application on another Windows machine
 
-`setup-scrum.ps1` targets `ishussien.atlassian.net`, Jira project `SCRUM`, and
-board `1`. For another Jira site, project, or board, follow the
-[direct CLI instructions](#start-from-an-application-directory).
+`setup-scrum.ps1` defaults to `https://ishussien.atlassian.net`, Jira project
+`SCRUM`, and board `1`. To configure a Jira target, set `jira_url`, `jira_project`,
+and `jira_board_id` in `setup-scrum.json`. Use the
+[direct CLI instructions](#start-from-an-application-directory) if the target
+needs different issue type, priority, or status mappings.
 
 Clone this tool and the application repository. Keep the application's `main`
 branch clean and checked out. Have Python 3.12, Git, a signed-in Codex CLI, and
@@ -45,21 +47,35 @@ From the tool folder, run:
 .\setup-scrum.ps1
 ```
 
-The launcher uses the saved application path, Atlassian sign-in email, and API
-token automatically. It initializes the SCRUM board 1 mappings on a fresh clone
-and reuses that configuration on later runs.
+The launcher uses `setup-scrum.json` for the application path, Jira target,
+credentials, and agent-skills commit. Its `doctor` and `run` commands load
+settings from this file. The application repository stores runtime state per
+Jira target under its Git metadata. Direct CLI runs use their own configuration
+and state, so prior direct CLI checkpoints stay with that workflow.
 
-On a fresh clone, run the launcher and enter any values it prompts for. After
-`doctor` passes, the launcher creates `setup-scrum.json` beside `setup-scrum.ps1`.
-Choose `3` if you only want to finish setup.
+On a fresh clone, you can create `setup-scrum.json` beside `setup-scrum.ps1`
+before running the launcher. For example, this file sets the Jira target and
+lets the launcher obtain the application path and credentials from its usual
+fallbacks or prompts.
+
+```json
+{
+  "jira_url": "https://ishussien.atlassian.net",
+  "jira_project": "SCRUM",
+  "jira_board_id": 1
+}
+```
+
+After `doctor` passes, the launcher saves all settings to that file. Choose `3`
+if you only want to finish setup. Older settings files use the same defaults
+for missing Jira target fields and gain those fields after a successful `doctor`.
 
 For later runs, edit `application_path`, `jira_email`, and `jira_api_token` in
 that file. Use an absolute path with forward slashes or doubled backslashes in
 JSON. The token is stored in plain text, and `.gitignore` excludes the file from
 Git. Keep it private. The token prompt masks input.
 
-If the saved path is blank, the launcher checks the current Git repository and
-then the neighboring `Self-Improving App` folder for a matching configuration.
+If the saved path is blank, the launcher prompts for the application repository.
 Jira credentials in `setup-scrum.json` take precedence over PowerShell environment
 variables. The launcher uses a token with an associated email only when that
 email matches the selected account. It prompts for any values still missing
@@ -145,6 +161,10 @@ Alternatively pass the application directory before the command:
 
 Optional installation, from this tool's directory: `py -3 -m pip install .`.
 The installed command is `self-improve`, with the same arguments.
+
+To inspect state or resolve pending operations from the PowerShell launcher,
+include `--launcher-settings` before the command. For example, from the tool's
+directory run `py -3.12 self_improve.py --repo 'C:\path\to\application' --launcher-settings setup-scrum.json status`.
 
 ## Collaborate on Jira tickets
 

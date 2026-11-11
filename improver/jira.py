@@ -84,13 +84,20 @@ class Jira:
         self.opener = build_opener(NoRedirect())
         self._account_id = None
 
+    def base_url(self):
+        base = self.settings.get('base_url', '').rstrip('/')
+        try:
+            parsed = urlparse(base)
+        except ValueError as exc:
+            raise ConfigError('Invalid Jira base URL.') from exc
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
+            raise ConfigError('jira.base_url must be an HTTPS Jira site or api.atlassian.com/ex/jira/<cloudId>.')
+        return base
+
     def request(self, method, path, body=None):
         if self._transport:
             return self._transport(method, path, body)
-        base = self.settings.get('base_url', '').rstrip('/')
-        parsed = urlparse(base)
-        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
-            raise ConfigError('jira.base_url must be an HTTPS Jira site or api.atlassian.com/ex/jira/<cloudId>.')
+        base = self.base_url()
         email, token = os.environ.get('JIRA_EMAIL'), os.environ.get('JIRA_API_TOKEN')
         if not email or not token:
             raise ConfigError('Set JIRA_EMAIL and JIRA_API_TOKEN in the environment.')

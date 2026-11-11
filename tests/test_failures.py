@@ -75,6 +75,46 @@ class ProcessTests(unittest.TestCase):
 
 
 class PinAndCliTests(unittest.TestCase):
+    def test_launcher_doctor_uses_only_launcher_settings_and_keeps_targets_separate(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'app'
+            make_repo(root)
+            repo = Repository(root, Runner())
+            repo.home.mkdir(parents=True)
+            legacy = repo.home / 'config.json'
+            legacy.write_text('invalid JSON', encoding='utf-8')
+            settings = Path(d) / 'setup-scrum.json'
+            pin = 'a' * 40
+            args = ['--repo', str(root), '--launcher-settings', str(settings), 'doctor']
+            for project, board in [('OTHER', 82), ('SCRUM', 1)]:
+                settings.write_text(json.dumps({'jira_url': 'https://fixture.invalid/', 'jira_project': project,
+                                                 'jira_board_id': board, 'jira_api_token': 'fixture-secret'}),
+                                    encoding='utf-8-sig')
+                with patch('improver.cli.prepare_skills', return_value=(str(repo.home / 'agent-skills'), pin)), \
+                        patch('improver.cli.codex_command', return_value=[sys.executable]), \
+                        patch('improver.cli.configure_logging'), \
+                        patch('improver.cli.doctor', return_value={'jira': 'OK'}) as doctor, \
+                        redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(args), 0)
+                cfg = doctor.call_args.args[0]
+                self.assertEqual((cfg.jira['project'], cfg.jira['board_id']), (project, board))
+                self.assertEqual(json.loads(output.getvalue())['launcher_settings'],
+                                 {'jira_url': 'https://fixture.invalid', 'jira_project': project,
+                                  'jira_board_id': board, 'skills_commit': pin})
+                self.assertNotIn('fixture-secret', output.getvalue())
+                if legacy.exists():
+                    self.assertEqual(legacy.read_text(encoding='utf-8'), 'invalid JSON')
+                    legacy.unlink()
+            self.assertFalse(legacy.exists())
+            self.assertEqual(len(list((repo.home / 'launcher').glob('*/state.db'))), 2)
+            with patch('improver.cli.prepare_skills', return_value=(str(repo.home / 'agent-skills'), pin)), \
+                    patch('improver.cli.codex_command', return_value=[sys.executable, '-c', 'pass']), \
+                    patch('improver.cli.configure_logging'), patch.object(Jira, 'doctor'), patch.object(Agent, 'skills'), \
+                    patch.object(engine_fixtures.Engine, 'cycle', autospec=True) as cycle:
+                self.assertEqual(main([*args[:-1], 'run', '--once']), 0)
+                self.assertEqual(cycle.call_args.args[0].config.jira['project'], 'SCRUM')
+            self.assertFalse(legacy.exists())
+
     def test_init_pins_local_skills_and_detects_tampering(self):
         with tempfile.TemporaryDirectory() as d:
             root, skills = Path(d) / 'app', Path(d) / 'skills-source'
