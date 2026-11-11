@@ -277,9 +277,15 @@ class Jira:
         self.request('POST', f'/rest/api/3/issue/{key}/transitions', body)
 
     def block(self, key, reason):
-        # Jira update operations make this safe to retry without adding duplicate comments.
+        statuses = self.settings['statuses']
+        blocked = self.blocked_status
+        self.transition(key, blocked, expected=(self.approval_status, statuses['in_progress'], blocked))
         self.request('PUT', f'/rest/api/3/issue/{key}', {'update': {'labels': [{'add': BLOCKED_LABEL}]}})
         self.request('PUT', f'/rest/api/3/issue/{key}/properties/self-improver-result', {'blocked': True, 'reason': reason})
+
+    @property
+    def blocked_status(self):
+        return self.settings['statuses'].get('blocked', 'Blocked')
 
     def complete(self, key, result):
         self.request('PUT', f'/rest/api/3/issue/{key}/properties/self-improver-result', result)
@@ -307,9 +313,12 @@ class Jira:
         statuses = self.settings.get('statuses', {})
         if not all(statuses.get(s) for s in ('backlog', 'in_progress', 'done')):
             raise ConfigError('Map backlog, in_progress and done to Jira status names.')
-        required_statuses = {*statuses.values(), self.approval_status}
+        required_statuses = {*statuses.values(), self.approval_status, self.blocked_status}
         if not self.approval_status or self.approval_status in {statuses[s] for s in ('backlog', 'in_progress', 'done')}:
             raise ConfigError('The Jira approval status must be distinct from backlog, in progress and done.')
+        if not self.blocked_status or self.blocked_status in {
+                statuses['backlog'], statuses['in_progress'], statuses['done'], self.approval_status}:
+            raise ConfigError('The Jira blocked status must be distinct from the other workflow statuses.')
         workflows = self.request('GET', f'/rest/api/3/project/{quote(project)}/statuses')
         for type_id in set(types.values()):
             records = [w for w in workflows if str(w['id']) == str(type_id)]

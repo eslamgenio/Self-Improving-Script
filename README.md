@@ -257,6 +257,15 @@ The controller executes baseline checks and ticket-specific test/runtime checks,
 then reruns them on the committed snapshot. A failing check or rejected review
 allows two repair attempts, then blocks the ticket and preserves the worktree.
 
+If a setup command runs `python -m pip install --no-index -r requirements.txt`
+and pip reports a missing distribution, the controller downloads wheels for the
+same requirements from pip's configured package index and retries the offline
+install with those wheels. The download and retry run once per setup attempt.
+If recovery fails, the Jira blocker comment includes the original install
+error and the recovery error. Recovery was verified in a fresh Python 3.12
+environment with the application's full pinned requirements. The retry
+installed `asgiref==3.13.0` and `pip check` passed.
+
 After Jira scope approval, the configured run uses ticket criteria and the
 independent review for routine specification and merge checks. Unresolved
 requirements and remaining mandatory human approval requirements block work.
@@ -295,9 +304,15 @@ property `self-improver-result`, accessible at
 Generated tickets have `self-improver`, `self-improver-app-<app-id>` and fingerprint
 labels. Manual tickets can enter the same approval flow without these labels.
 Among eligible Ready for Automation tickets, Jira priority wins, with oldest creation time and
-issue key as tie breakers. A ticket carrying
-`self-improver-blocked` is excluded. Resolve its blocker and remove that label in
-Jira to make it eligible again. Unresolved generated dependencies start blocked.
+issue key as tie breakers. When automation blocks on a prerequisite or
+verification failure, it moves the ticket to **Blocked** and posts the reason
+as a Jira comment. The workflow must allow this transition from **Ready for
+Automation** and **In Progress**. Set `jira.statuses.blocked` if your workflow
+uses a different status name.
+
+To retry after resolving the blocker, remove the `self-improver-blocked` label,
+move the ticket to **To Do**, then approve it again. Generated tickets with
+unresolved dependencies start in the backlog with the blocker label.
 
 After an uncertain create response the tool searches Jira for the exact fingerprint.
 It **never blindly retries** creation. Jira indexing can take time. If it remains

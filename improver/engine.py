@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from tempfile import TemporaryDirectory
 import uuid
 
 from .agent import validate_commands, validate_recommendations, validate_schema, IMPLEMENT_SCHEMA, REVIEW_SCHEMA
@@ -96,6 +97,7 @@ class Engine:
                     self.jira.complete(item['key'], result)
                 elif item['kind'] == 'blocked':
                     self.jira.block(item['key'], item['reason'])
+                    self.deliver_comment(identity, item, f'Automation blocked\n\n{item["reason"]}')
                 else:
                     raise ConfigError(f'Unknown outbox operation {item["kind"]}.')
             except JiraNotFound:
@@ -289,11 +291,34 @@ class Engine:
             raise ApprovalChanged(f'{key}: Jira issue was deleted or is no longer visible.') from exc
         return {'key': key, 'fields': {name: ticket['fields'].get(name) for name in ('summary', 'description')}}
 
+    def run_setup(self, argv, cwd):
+        timeout = self.config.command_timeout
+        try:
+            return self.runner.run(argv, cwd, timeout)
+        except Blocked as failure:
+            # Recover direct pip requirements installs. Preserve the failure for
+            # unrelated commands and for pip errors other than missing candidates.
+            if argv[1:4] != ['-m', 'pip', 'install'] or '--no-index' not in argv[4:]:
+                raise
+            if 'No matching distribution found for' not in str(failure):
+                raise
+            requirements = [arg for arg in argv[4:] if arg not in ('--no-index', '--only-binary=:all:')]
+            if len(requirements) != 2 or requirements[0] not in ('-r', '--requirement'):
+                raise
+            print('Offline pip install could not find a dependency. Downloading wheels and retrying.', flush=True)
+            with TemporaryDirectory(prefix='self-improver-wheels-') as wheels:
+                try:
+                    self.runner.run([*argv[:3], 'download', '--only-binary=:all:', '--dest', wheels,
+                                     *requirements], cwd, timeout)
+                    return self.runner.run([*argv, '--find-links', wheels], cwd, timeout)
+                except Blocked as retry_failure:
+                    raise Blocked(f'{failure}\nDependency recovery failed:\n{retry_failure}') from retry_failure
+
     def run_checks(self, commands, cwd, setup=False):
         evidence = []
         if setup:
             for argv in commands['setup']:
-                evidence.append(self.runner.run(argv, cwd, self.config.command_timeout))
+                evidence.append(self.run_setup(argv, cwd))
         for check in commands['checks']:
             result = self.runner.run(check['argv'], cwd, self.config.command_timeout)
             evidence.append({'name': check['name'], 'kind': check['kind'], **result})
@@ -422,7 +447,7 @@ class Engine:
             try:
                 # Always rerun setup on resume; supported setup commands must be idempotent.
                 for argv in cycle['commands']['setup']:
-                    self.runner.run(argv, work, self.config.command_timeout)
+                    self.run_setup(argv, work)
                 ticket = self.require_approval(cycle, status)
                 for record in self.state.get('recommendations', {}).values():
                     if record.get('key') == cycle['key']:

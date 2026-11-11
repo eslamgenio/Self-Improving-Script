@@ -115,6 +115,7 @@ class MemoryJira(Jira):
         self.completed.append(key)
 
     def block(self, key, reason):
+        self.transition(key, self.blocked_status, expected=(self.approval_status, 'Working', self.blocked_status))
         self.issue(key)['fields']['labels'].append('self-improver-blocked')
         self.blocked.append(key)
 

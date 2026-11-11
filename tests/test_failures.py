@@ -12,6 +12,7 @@ from unittest.mock import patch
 from improver.agent import Agent, validate_schema, RECOMMENDATIONS_SCHEMA
 from improver.cli import main
 from improver.core import Blocked, Config, ConfigError, Runner, State, TransientError
+from improver.engine import Engine
 from improver.git import Repository
 from improver.jira import Jira, retry_seconds
 import test_engine as engine_fixtures
@@ -20,6 +21,24 @@ from test_jira import FakeTransport
 
 
 class ProcessTests(unittest.TestCase):
+    def test_setup_downloads_missing_wheels_and_retries_offline(self):
+        runner = Runner(None)
+        engine = Engine(Config(), None, None, None, None, runner)
+        argv = [sys.executable, '-m', 'pip', 'install', '--no-index',
+                '--only-binary=:all:', '-r', 'requirements.txt']
+        with tempfile.TemporaryDirectory() as work:
+            missing = Blocked('ERROR: No matching distribution found for asgiref==3.13.0')
+            with patch.object(runner, 'run', side_effect=[missing, {'code': 0}, {'code': 0}]) as run:
+                self.assertEqual(engine.run_checks({'setup': [argv], 'checks': []}, Path(work), setup=True),
+                                 [{'code': 0}])
+            first, download, retry = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(first, argv)
+            wheel_dir = download[download.index('--dest') + 1]
+            self.assertEqual(download, [sys.executable, '-m', 'pip', 'download', '--only-binary=:all:',
+                                        '--dest', wheel_dir, '-r', 'requirements.txt'])
+            self.assertEqual(retry, [*argv, '--find-links', wheel_dir])
+            self.assertFalse(Path(wheel_dir).exists())
+
     def test_relative_virtualenv_executable_resolves_from_worktree(self):
         import venv
         with tempfile.TemporaryDirectory() as d:
@@ -320,6 +339,10 @@ class MoreEngineTests(engine_fixtures.EngineCase):
             self.engine.cycle()
             implement.assert_not_called()
         self.assertEqual(self.jira.blocked, ['APP-1'])
+        self.assertEqual(self.jira.issue('APP-1')['fields']['status']['name'], 'Blocked')
+        comments = list(self.jira.comments('APP-1'))
+        self.assertEqual(len(comments), 1)
+        self.assertIn('Command failed (1)', json.dumps(comments[0]['body']))
 
     def test_target_change_during_review_is_preserved_without_merge(self):
         original = self.agent.review
