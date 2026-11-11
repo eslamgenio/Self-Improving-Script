@@ -141,6 +141,7 @@ class MoreEngineTests(engine_fixtures.EngineCase):
         self.cfg.commands = {'setup': [], 'checks': [
             {'name': 'fail', 'kind': 'test', 'argv': [sys.executable, '-c', 'raise SystemExit(1)']},
             {'name': 'runtime', 'kind': 'runtime', 'argv': [sys.executable, '-c', 'print(1)']}]}
+        self.create_and_approve()
         with patch.object(self.agent, 'implement') as implement:
             self.engine.cycle()
             implement.assert_not_called()
@@ -154,12 +155,14 @@ class MoreEngineTests(engine_fixtures.EngineCase):
             git(self.root, 'commit', '-m', 'concurrent user change')
             return original(*args)
         self.agent.review = review
+        self.create_and_approve()
         self.engine.cycle()
         self.assertTrue((self.root / 'user.txt').exists())
         self.assertFalse((self.root / 'APP-1.txt').exists())
         self.assertEqual(self.jira.blocked, ['APP-1'])
 
     def test_recovery_after_merge_before_checkpoint(self):
+        self.create_and_approve()
         self.jira.fail_complete = True
         with self.assertRaises(TransientError):
             self.engine.cycle()
@@ -189,6 +192,7 @@ class MoreEngineTests(engine_fixtures.EngineCase):
             git(self.root, 'checkout', '-b', 'user-branch', commit)
             return original(ticket, before, commit, *args)
         self.agent.review = review
+        self.create_and_approve()
         self.engine.cycle()
         self.assertEqual(git(self.root, 'rev-parse', 'refs/heads/main'), base)
         self.assertFalse(self.jira.completed)

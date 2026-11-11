@@ -150,6 +150,10 @@ class State:
     def pending(self):
         return [(key, json.loads(value)) for key, value in self.db.execute('SELECT id,value FROM outbox ORDER BY rowid')]
 
+    def update_pending(self, key, value):
+        with self.db:
+            self.db.execute('UPDATE outbox SET value=? WHERE id=?', (canonical(value), key))
+
     def acknowledge(self, key):
         with self.db:
             self.db.execute('DELETE FROM outbox WHERE id=?', (key,))

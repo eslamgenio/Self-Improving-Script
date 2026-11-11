@@ -10,13 +10,14 @@ import threading
 import unittest
 from unittest.mock import patch
 from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlsplit
 
 from improver.agent import Agent
 from improver.cli import main
 from improver.core import Config, Runner, State, TransientError
 from improver.engine import Engine
 from improver.git import Repository
-from improver.jira import Jira
+from improver.jira import Jira, adf
 from test_git_agent import make_repo, git
 
 
@@ -26,6 +27,7 @@ def server():
         items = []
         limited = False
         requests_seen = []
+        comments = {}
 
         def log_message(self, *args):
             pass
@@ -42,6 +44,8 @@ def server():
                 return
             if self.path.endswith('/search/jql'):
                 selected = self.items
+                if 'status = "Open"' in body.get('jql', ''):
+                    selected = [i for i in selected if i['fields']['status']['name'] == 'Open']
                 if 'self-improver-fp-' in body.get('jql', ''):
                     selected = [i for i in selected if any(label in body['jql'] for label in i['fields']['labels'] if 'fp-' in label)]
                 result = {'issues': selected, 'isLast': True}
@@ -51,6 +55,20 @@ def server():
                 issue = {'key': f'APP-{len(self.items)+1}', 'fields': fields}
                 self.items.append(issue)
                 result, status = {'key': issue['key']}, 201
+            elif self.path == '/rest/api/3/myself':
+                result = {'accountId': 'operator'}
+            elif '/comment' in self.path:
+                key = self.path.split('/issue/')[1].split('/')[0]
+                comments = self.comments.setdefault(key, [])
+                if self.command == 'GET':
+                    start = int(parse_qs(urlsplit(self.path).query)['startAt'][0])
+                    result = {'comments': comments[start:start + 1], 'total': len(comments)}
+                else:
+                    result = {**body, 'id': str(len(comments) + 1), 'author': {'accountId': 'operator'}}
+                    comments.append(result)
+                    status = 201
+            elif '/changelog' in self.path:
+                result = {'values': [], 'total': 0, 'isLast': True}
             elif '/board/1/issue' in self.path:
                 result = {'issues': self.items}
             elif '/backlog/' in self.path:
@@ -127,15 +145,33 @@ class IntegrationTests(unittest.TestCase):
                 jira = Jira(cfg)
                 jira.opener = opener
                 engine = Engine(cfg, repo, state, jira, agent, runner)
+                def approve(key):
+                    revision = handler.comments[key][-1]['properties'][0]['value'].rsplit(':', 1)[1]
+                    handler.comments[key].append({'id': 'operator-approval', 'author': {'accountId': 'operator'},
+                                                  'body': adf(f'approve {revision}')})
                 original = repo.head()
+                engine.cycle()
+                self.assertEqual(original, repo.head())
+                approve('APP-1')
                 engine.cycle()
                 first = repo.head()
                 engine.cycle()
+                approve('APP-2')
+                engine.cycle()
                 self.assertNotEqual(original, first)
                 self.assertNotEqual(first, repo.head())
-                self.assertEqual([i['fields']['summary'] for i in handler.items], ['Add greeting', 'Add farewell', 'Add shout'])
-                self.assertEqual([i['fields']['status']['name'] for i in handler.items], ['Done', 'Done', 'Open'])
-                self.assertIn('def farewell', (root / 'app.py').read_text())
+                self.assertEqual([i['fields']['summary'] for i in handler.items], ['Add greeting', 'Add shout'])
+                self.assertEqual([i['fields']['status']['name'] for i in handler.items], ['Done', 'Done'])
+                self.assertIn('def shout', (root / 'app.py').read_text())
+                summary = handler.comments['APP-2'][-1]['body']
+                self.assertIn(repo.head(), json.dumps(summary))
+                self.assertIn('passed', json.dumps(summary))
+                writes = [(path, body) for method, path, body in handler.requests_seen if method == 'POST']
+                comment = next(i for i, (path, body) in enumerate(writes)
+                               if path.endswith('/APP-2/comment') and 'Implementation summary' in json.dumps(body))
+                done = next(i for i, (path, body) in enumerate(writes)
+                            if path.endswith('/APP-2/transitions') and body['transition']['id'] == 'Done')
+                self.assertLess(comment, done)
                 self.assertFalse(state.pending())
                 self.assertEqual(git(root, 'status', '--porcelain'), '')
                 transcripts = list((repo.home / 'sessions').glob('*/events.jsonl'))

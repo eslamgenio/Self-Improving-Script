@@ -208,7 +208,8 @@ in current_behavior, and full migration/rollback implications for breaking chang
 
     def implement(self, ticket, context, commands, feedback, cwd):
         extra = ticket.get('planned_recommendation', {}).get('skills', [])
-        prompt = f'''PHASE implement. Implement only this ticket using the attached workflows.
+        prompt = f'''PHASE implement. The Jira title and description define the approved scope.
+Implement only this scope using the attached workflows.
 Use red/green tests, update docs/spec and migration guidance. Do not commit; controller does it.
 Provide ticket_checks with regression and runtime commands. acceptance_evidence must map to
 all acceptance criteria; documentation/tests_added list changed paths. Report blocked when

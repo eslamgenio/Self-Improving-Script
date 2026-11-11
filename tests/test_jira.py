@@ -14,6 +14,21 @@ class FakeTransport:
 
 
 class JiraTests(unittest.TestCase):
+    def test_todo_query_is_project_wide_even_for_manually_created_issues(self):
+        transport = FakeTransport([{'issues': [{'key': 'X-1'}], 'isLast': True}])
+        client = Jira(Config(jira={'project': 'X', 'statuses': {'backlog': 'To Do'}}), transport=transport)
+        self.assertEqual(client.todo(), [{'key': 'X-1'}])
+        self.assertEqual(transport.calls[0][2]['jql'], 'project = "X" AND (status = "To Do")')
+
+    def test_changelog_pages_detect_scope_edits_without_confusing_status_changes(self):
+        transport = FakeTransport([
+            {'total': 2, 'values': [{'id': '1', 'items': [{'fieldId': 'description'}]}]},
+            {'total': 2, 'values': [{'id': '2', 'items': [{'fieldId': 'status'}]}]},
+        ])
+        client = Jira(Config(), transport=transport)
+        self.assertEqual(client.last_field_edit('X-1', {'summary', 'description'}), '1')
+        self.assertIn('startAt=1', transport.calls[1][1])
+
     def test_search_paginates_and_is_application_scoped(self):
         transport = FakeTransport([{'issues': [{'key': 'X-1'}], 'nextPageToken': 'next'},
                                    {'issues': [{'key': 'X-2'}], 'isLast': True}])

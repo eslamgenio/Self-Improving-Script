@@ -1,8 +1,9 @@
 # Application Self-Improver
 
 A Python controller that reviews an application's source with Codex CLI, creates
-up to three Jira Cloud backlog tickets, implements the highest-priority eligible
-ticket in a Git worktree, verifies it, and fast-forwards the local target branch.
+a Jira Cloud backlog ticket when To Do is empty, and implements the highest-priority
+approved ticket in a Git worktree. It verifies the change and fast-forwards the
+local target branch.
 It repeats five minutes after each cycle until you press Ctrl+C.
 
 Product growth and user experience guide recommendations. Critical security,
@@ -21,7 +22,7 @@ application purpose. Ambiguous product decisions block the ticket.
   tree, and its target branch checked out. Install that application's toolchains.
 - Jira **Cloud Software**, a project and board with backlog enabled. The account
   needs Browse Projects, Create Issues, Edit Issues, Transition Issues and
-  Schedule Issues, plus access to the board and issue properties.
+  Schedule Issues, and Add Comments, plus access to the board and issue properties.
 - An Atlassian account email and API token. Use the site URL for an unscoped token;
   scoped tokens use `https://api.atlassian.com/ex/jira/<cloudId>` as the base URL.
 
@@ -145,6 +146,33 @@ Alternatively pass the application directory before the command:
 Optional installation, from this tool's directory: `py -3 -m pip install .`.
 The installed command is `self-improve`, with the same arguments.
 
+## Collaborate on Jira tickets
+
+Any visible issue in the configured project's To Do status pauses ticket creation.
+This includes manual, blocked, and unapproved tickets. When To Do is empty, the
+controller can create one ticket after checking the backlog again. Jira search
+can take time to reflect newly added issues.
+
+1. Create a ticket in To Do or open one the controller created. Write the scope
+   and acceptance criteria in the description. The controller waits when the
+   description is blank.
+2. When the controller comments with an approval revision, review the current
+   title and description. Reply with the exact `approve <revision>` command from
+   the same Jira account configured for the controller.
+3. Change the title or description to revise the scope. Approve the new revision
+   when the controller requests it. Delete the approval reply to withdraw it.
+   Delete, block, or move a ticket out of To Do to take it out of the queue.
+
+During implementation, the controller checks that the ticket remains in progress
+and the scope still has approval. If approval is lost or the ticket is removed
+from the workflow, it stops at the next check and preserves any worktree. Return
+an in-progress ticket to To Do to request approval for a changed scope. Work
+started before scope approval was introduced also needs approval before it can
+continue.
+
+After a local merge, the controller comments on the ticket with the implementation
+summary, check results, and commit ID, then transitions it to Done.
+
 ## Validation and agent workflows
 
 Codex discovers noninteractive local setup, test, lint, build and runtime-smoke
@@ -183,10 +211,10 @@ The controller executes baseline checks and ticket-specific test/runtime checks,
 then reruns them on the committed snapshot. A failing check or rejected review
 allows two repair attempts, then blocks the ticket and preserves the worktree.
 
-Noninteractive operation is pre-authorized by the configured run: ordinary
-specification and merge approval prompts are replaced with ticket criteria and
-the independent review. Unresolved requirements and remaining mandatory human
-approval requirements block work. The loop never weakens checks to obtain a pass.
+After Jira scope approval, the configured run uses ticket criteria and the
+independent review for routine specification and merge checks. Unresolved
+requirements and remaining mandatory human approval requirements block work.
+The loop never weakens checks to obtain a pass.
 An application without meaningful checks needs those checks established first.
 
 The local target branch must remain clean, on the configured branch and at the
@@ -218,9 +246,10 @@ idempotent issue-property/status operations. Evidence is stored in the Jira issu
 property `self-improver-result`, accessible at
 `/rest/api/3/issue/APP-123/properties/self-improver-result`, and in local status/logs.
 
-Tickets have `self-improver`, `self-improver-app-<app-id>` and fingerprint labels.
-Only this application's tool-created tickets are eligible. Actual Jira priority
-wins, with oldest creation time and issue key as tie breakers. A ticket carrying
+Generated tickets have `self-improver`, `self-improver-app-<app-id>` and fingerprint
+labels. Manual tickets can enter the same approval flow without these labels.
+Among approved To Do tickets, Jira priority wins, with oldest creation time and
+issue key as tie breakers. A ticket carrying
 `self-improver-blocked` is excluded. Resolve its blocker and remove that label in
 Jira to make it eligible again. Unresolved generated dependencies start blocked.
 
@@ -233,6 +262,10 @@ py -3 $tool resolve-create FINGERPRINT --issue APP-123
 # Only after confirming that no ticket was created:
 py -3 $tool resolve-create FINGERPRINT --not-created
 ```
+
+If Jira comment delivery remains uncertain, check the issue and find the pending
+operation ID in `status`. After verifying that the comment is absent, allow a
+retry with `py -3 $tool resolve-comment OPERATION_ID --not-posted`.
 
 Transient failures use exponential backoff (30 seconds up to 30 minutes). Jira's
 longer `Retry-After` is honored. Authentication/configuration errors exit with a
@@ -251,7 +284,7 @@ This is a source-repository improvement tool, not a guarantee that arbitrary
 applications improve. Review quality depends on Codex, documentation and tests.
 Exact-title/fingerprint duplicates are rejected deterministically; semantic
 duplicates are also checked by the review agent and remain a model judgment.
-Three tickets is a maximum, not a quota. Backlog size can grow without limit.
+Each cycle can add at most one ticket, and any visible To Do ticket pauses creation.
 Model context contains up to 200 prioritized open-ticket excerpts and 200 recent
 historical summaries; deterministic duplicate detection and ticket selection
 still inspect the full backlog. Source inventory is capped at 10,000 eligible

@@ -16,6 +16,32 @@ from .core import Blocked, ConfigError, TransientError, canonical, redact
 
 ORIGIN = 'self-improver'
 BLOCKED_LABEL = 'self-improver-blocked'
+COMMENT_MARKER = 'self-improver-operation'
+
+
+class JiraNotFound(ConfigError):
+    """Jira cannot show the requested issue or resource."""
+
+
+def has_description(value):
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return has_description(value.get('text')) or any(has_description(node) for node in value.get('content', []))
+    return False
+
+
+def approval_text(body):
+    """Read a standalone text paragraph, excluding quotes and code blocks."""
+    if not isinstance(body, dict) or body.get('type') != 'doc':
+        return ''
+    paragraphs = body.get('content', [])
+    if len(paragraphs) != 1 or paragraphs[0].get('type') != 'paragraph':
+        return ''
+    nodes = paragraphs[0].get('content', [])
+    if any(node.get('type') != 'text' for node in nodes):
+        return ''
+    return ''.join(node.get('text', '') for node in nodes).strip()
 
 
 def adf(text):
@@ -56,6 +82,7 @@ class Jira:
         self.label = f'self-improver-app-{config.app_id}'
         self._transport = transport
         self.opener = build_opener(NoRedirect())
+        self._account_id = None
 
     def request(self, method, path, body=None):
         if self._transport:
@@ -80,17 +107,21 @@ class Jira:
             detail = redact(exc.read().decode(errors='replace'))[:2000]
             if exc.code == 429 or exc.code >= 500:
                 raise TransientError(f'Jira HTTP {exc.code}: {detail}', retry_seconds(exc.headers.get('Retry-After'))) from exc
+            if exc.code == 404:
+                raise JiraNotFound(f'Jira HTTP 404: {detail}') from exc
             raise ConfigError(f'Jira HTTP {exc.code}: {detail}') from exc
         except (URLError, TimeoutError, ConnectionError) as exc:
             raise TransientError(f'Jira connection failed: {exc}') from exc
         except ValueError as exc:
             raise TransientError('Jira returned malformed JSON; pending writes require reconciliation.') from exc
 
-    def issues(self, extra=''):
+    def issues(self, extra='', *, project_wide=False):
         project = self.settings.get('project', '')
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', project):
             raise ConfigError('jira.project must be a Jira project key.')
-        jql = f'project = "{project}" AND labels = "{ORIGIN}" AND labels = "{self.label}"'
+        jql = f'project = "{project}"'
+        if not project_wide:
+            jql += f' AND labels = "{ORIGIN}" AND labels = "{self.label}"'
         if extra:
             jql += f' AND ({extra})'
         items, token, seen = [], None, set()
@@ -108,10 +139,66 @@ class Jira:
                 raise TransientError('Jira repeated a pagination token.')
             seen.add(token)
 
+    def todo(self):
+        status = json.dumps(self.settings['statuses']['backlog'], ensure_ascii=False)
+        return self.issues(f'status = {status}', project_wide=True)
+
     def issue(self, key):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*-\d+', key):
             raise ConfigError('Invalid Jira issue key.')
         return self.request('GET', f'/rest/api/3/issue/{key}')
+
+    def account_id(self):
+        if self._account_id is None:
+            self._account_id = self.request('GET', '/rest/api/3/myself').get('accountId')
+            if not self._account_id:
+                raise ConfigError('Jira did not identify the authenticated account for scope approval.')
+        return self._account_id
+
+    def last_field_edit(self, key, fields):
+        # Jira returns issue changelogs in date order, oldest first.
+        latest, start = None, 0
+        while True:
+            page = self.request('GET', f'/rest/api/3/issue/{key}/changelog?startAt={start}&maxResults=100')
+            entries = page['values']
+            for entry in entries:
+                if any((change.get('fieldId') or change.get('field')) in fields
+                       for change in entry['items']):
+                    latest = entry['id']
+            start += len(entries)
+            if page.get('isLast') or start >= page['total']:
+                return latest
+            if not entries:
+                raise TransientError(f'{key}: Jira changelog pagination did not advance.')
+
+    def comments(self, key):
+        start = 0
+        while True:
+            query = urlencode({'startAt': start, 'maxResults': 100, 'expand': 'properties'})
+            page = self.request('GET', f'/rest/api/3/issue/{key}/comment?{query}')
+            comments = page['comments']
+            yield from comments
+            start += len(comments)
+            if start >= page['total']:
+                return
+            if not comments:
+                raise TransientError(f'{key}: Jira comment pagination did not advance.')
+
+    def add_comment(self, key, text, marker):
+        self.request('POST', f'/rest/api/3/issue/{key}/comment',
+                     {'body': adf(text), 'properties': [{'key': COMMENT_MARKER, 'value': marker}]})
+
+    def comment_exists(self, comments, marker):
+        return any(comment.get('author', {}).get('accountId') == self.account_id()
+                   and any(prop['key'] == COMMENT_MARKER and prop['value'] == marker
+                           for prop in comment.get('properties', [])) for comment in comments)
+
+    def approval(self, comments, revision):
+        account = self.account_id()
+        return next((str(comment['id']) for comment in comments
+                     if comment.get('author', {}).get('accountId') == account
+                     and comment.get('updateAuthor', comment['author']).get('accountId') == account
+                     and approval_text(comment['body']) == f'approve {revision}'), None)
 
     def select(self, issues):
         priorities = self.settings['priorities']
@@ -140,16 +227,26 @@ class Jira:
 
     def place_backlog(self, key):
         board = int(self.settings['board_id'])
+        ticket = self.issue(key)
+        status = ticket['fields']['status']
+        backlog = self.settings['statuses']['backlog']
+        if ticket['key'] != key:
+            return
+        if status['name'] != backlog and (status.get('statusCategory', {}).get('key') != 'new'
+                                          or self.last_field_edit(key, {'status'})):
+            return
         # A backlog call cannot add an issue excluded by the board's filter.
         query = urlencode({'jql': f'key = "{key}"', 'fields': 'key'})
         result = self.request('GET', f'/rest/agile/1.0/board/{board}/issue?{query}')
         if not any(i['key'] == key for i in result.get('issues', [])):
             raise TransientError(f'{key} is not visible on board {board}; check the board filter or wait for indexing.')
         self.request('POST', f'/rest/agile/1.0/backlog/{board}/issue', {'issues': [key]})
-        self.transition(key, self.settings['statuses']['backlog'])
+        self.transition(key, backlog, expected=(status['name'], backlog))
 
-    def transition(self, key, destination):
+    def transition(self, key, destination, *, expected=None):
         current = self.issue(key)['fields']['status']['name']
+        if expected is not None and current not in expected:
+            raise Blocked(f'{key}: Jira status changed to {current} before transition.')
         if current == destination:
             return
         result = self.request('GET', f'/rest/api/3/issue/{key}/transitions?expand=transitions.fields')
@@ -173,17 +270,19 @@ class Jira:
 
     def complete(self, key, result):
         self.request('PUT', f'/rest/api/3/issue/{key}/properties/self-improver-result', result)
-        self.transition(key, self.settings['statuses']['done'])
+        statuses = self.settings['statuses']
+        self.transition(key, statuses['done'], expected=(statuses['in_progress'], statuses['done']))
 
     def doctor(self):
-        self.request('GET', '/rest/api/3/myself')
+        self.account_id()
         project = self.settings.get('project', '')
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', project):
             raise ConfigError('Set jira.project to a valid project key.')
         if not self.settings.get('board_id'):
             raise ConfigError('Set jira.board_id to a Jira Software board with backlog enabled.')
         self.request('GET', f'/rest/agile/1.0/board/{int(self.settings["board_id"])}')
-        permission_names = ['BROWSE_PROJECTS', 'CREATE_ISSUES', 'EDIT_ISSUES', 'TRANSITION_ISSUES', 'SCHEDULE_ISSUES']
+        permission_names = ['BROWSE_PROJECTS', 'CREATE_ISSUES', 'EDIT_ISSUES', 'TRANSITION_ISSUES', 'SCHEDULE_ISSUES',
+                            'ADD_COMMENTS']
         query = urlencode({'projectKey': project, 'permissions': ','.join(permission_names)})
         permissions = self.request('GET', '/rest/api/3/mypermissions?' + query).get('permissions', {})
         missing = [p for p in permission_names if not permissions.get(p, {}).get('havePermission')]

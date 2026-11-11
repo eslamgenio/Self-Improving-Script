@@ -92,6 +92,9 @@ def parser():
     choice = resolve.add_mutually_exclusive_group(required=True)
     choice.add_argument('--issue', help='The Jira key that was created; identity labels will be verified.')
     choice.add_argument('--not-created', action='store_true', help='Assert Jira did not create the ticket and allow a retry.')
+    resolve_comment = commands.add_parser('resolve-comment', help='Retry a comment after checking it was not posted in Jira.')
+    resolve_comment.add_argument('operation_id')
+    resolve_comment.add_argument('--not-posted', action='store_true', required=True)
     return result
 
 
@@ -126,7 +129,8 @@ def execute(args):
         with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
             values = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM kv')}
             recent = [json.loads(v) for (v,) in db.execute('SELECT value FROM events ORDER BY id DESC LIMIT 10')]
-            pending = [json.loads(v) for (v,) in db.execute('SELECT value FROM outbox')]
+            pending = [{'operation_id': key, **json.loads(value)}
+                       for key, value in db.execute('SELECT id,value FROM outbox')]
         uncertain = [fp for fp, record in values.get('recommendations', {}).items()
                      if record.get('attempted') and not record.get('key')]
         print(redact(json.dumps({'cycle': values.get('cycle'), 'last_cycle': values.get('last_cycle'),
@@ -164,8 +168,18 @@ def execute(args):
                     if matches:
                         raise ConfigError('Matching tickets exist; use --issue instead.')
                     record['attempted'] = False
-                state.set('recommendations', records)
+                updates = {'recommendations': records}
+                if args.issue:
+                    updates['recent_jira_create'] = args.issue
+                state.set_many(updates)
                 print('Creation resolved. The next run resumes the interrupted cycle.')
+            elif args.command == 'resolve-comment':
+                item = dict(state.pending()).get(args.operation_id)
+                if not item or not item.get('comment_attempted') or item.get('comment_delivered'):
+                    raise ConfigError('Operation ID is not an unresolved attempted Jira comment.')
+                item['comment_attempted'] = False
+                state.update_pending(args.operation_id, item)
+                print('Comment resolved. The next run will check Jira before posting.')
             elif args.command == 'run':
                 # Static preflight once, including Jira field/workflow mappings. Baseline runs per ticket.
                 agent.skills('implement')
