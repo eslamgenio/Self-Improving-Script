@@ -1,7 +1,7 @@
 # Application Self-Improver
 
 A Python controller that reviews an application's source with Codex CLI, creates
-a Jira Cloud backlog ticket when no approved To Do ticket is ready to work on,
+a Jira Cloud backlog ticket when the automation queue has no eligible work,
 and implements the highest-priority eligible ticket in a Git worktree. It verifies
 the change and fast-forwards the local target branch.
 It repeats five minutes after each cycle until you press Ctrl+C.
@@ -186,29 +186,35 @@ The installed command is `self-improve`, with the same arguments.
 
 ## Collaborate on Jira tickets
 
-An approved To Do ticket pauses creation if the controller can work on it.
-The ticket needs a description, a mapped priority, and approval for its current
-scope. Tickets labeled `self-improver-blocked` and tickets assigned to another
-application are excluded. When no ticket qualifies, the controller can create
-one ticket per cycle and checks again just before creating it. Several tickets
-can wait in To Do for approval at the same time.
+Tickets enter the automation queue when a reviewer moves them from **To Do**
+to **Ready for Automation**. An eligible ticket also needs a description and a
+mapped priority. The controller excludes tickets labeled `self-improver-blocked`
+and tickets assigned to another application. When no ticket qualifies, it can
+create one To Do ticket per cycle and checks the ready queue again just before
+creating it.
 
-1. Create a ticket in To Do or open one the controller created. Write the scope
-   and acceptance criteria in the description. The controller waits when the
-   description is blank.
-2. When the controller comments with an approval revision, review the current
-   title and description. Reply with the exact `approve <revision>` command from
-   the same Jira account configured for the controller.
-3. Change the title or description to revise the scope. Approve the new revision
-   when the controller requests it. Delete the approval reply to withdraw it.
-   Delete, block, or move a ticket out of To Do to take it out of the queue.
+1. Open a To Do ticket and write the scope and acceptance criteria in the
+   description. Review the title and description, then move the ticket to
+   **Ready for Automation**. Move it back to **To Do** to withdraw approval.
+2. If you change the title or description after approval, the controller uses
+   Jira's change history to detect the edit, including edits that were later
+   reverted. It returns a ticket with stale approval to **To Do** when it
+   detects the change and stops any active work before merging. Review the
+   revised scope and move it to **Ready for Automation** again.
+3. Keep the workflow transitions from **Ready for Automation** to **In Progress**
+   and from both statuses back to **To Do** available to the controller.
+   Restrict the transition into **Ready for Automation** to your reviewers in
+   Jira if approval should be limited to specific people. If your workflow uses
+   another approval status name, set `jira.statuses.approved` in the Jira settings.
 
-During implementation, the controller checks that the ticket remains in progress
-and the scope still has approval. If approval is lost or the ticket is removed
-from the workflow, it stops at the next check and preserves any worktree. Return
-an in-progress ticket to To Do to request approval for a changed scope. Work
-started before scope approval was introduced also needs approval before it can
-continue.
+For tickets approved under the previous comment-based workflow, review the
+current scope and use the status transition. For older work already marked
+**In Progress**, first move it to **To Do**.
+
+In a live Jira Cloud test, the controller selected the ticket after approval.
+Separate title and description edits each returned it to **To Do**, and a fresh
+approval restored eligibility each time. A description edit while the ticket
+was **In Progress** also returned it to **To Do** when the approval guard ran.
 
 After a local merge, the controller comments on the ticket with the implementation
 summary, check results, and commit ID, then transitions it to Done.
@@ -288,7 +294,7 @@ property `self-improver-result`, accessible at
 
 Generated tickets have `self-improver`, `self-improver-app-<app-id>` and fingerprint
 labels. Manual tickets can enter the same approval flow without these labels.
-Among approved To Do tickets, Jira priority wins, with oldest creation time and
+Among eligible Ready for Automation tickets, Jira priority wins, with oldest creation time and
 issue key as tie breakers. A ticket carrying
 `self-improver-blocked` is excluded. Resolve its blocker and remove that label in
 Jira to make it eligible again. Unresolved generated dependencies start blocked.

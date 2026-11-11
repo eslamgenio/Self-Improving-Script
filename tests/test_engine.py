@@ -34,14 +34,14 @@ class MemoryJira(Jira):
         self.completed = []
         self.blocked = []
         self.comment_items = {}
-        self.scope_edits = {}
+        self.history = {}
         self.lose_comment_kind = None
 
     def issues(self, extra='', *, project_wide=False):
         return [i for i in self.items if not extra or any(label in extra for label in i['fields']['labels'] if 'fp-' in label)]
 
-    def todo(self):
-        return [i for i in self.items if i['fields']['status']['name'] == self.settings['statuses']['backlog']]
+    def ready(self):
+        return [i for i in self.items if i['fields']['status']['name'] == self.approval_status]
 
     def add_ticket(self, title, description, priority='1', labels=()):
         key = f'APP-{len(self.comment_items)+1}'
@@ -49,6 +49,7 @@ class MemoryJira(Jira):
                            'priority': {'id': priority}, 'created': key, 'labels': list(labels),
                            'status': {'name': 'Open', 'statusCategory': {'key': 'new'}}}})
         self.comment_items[key] = []
+        self.history[key] = []
         return key
 
     def create(self, rec, fp, base):
@@ -66,9 +67,15 @@ class MemoryJira(Jira):
                 return item
         raise JiraNotFound(key)
 
-    def last_field_edit(self, key, fields):
+    def changelog(self, key):
         self.issue(key)
-        return self.scope_edits.get(key)
+        return iter(self.history[key])
+
+    def record_change(self, key, **fields):
+        history = self.history[key]
+        history.append({'id': str(len(history) + 1), 'items': [
+            {'fieldId': field, **change} for field, change in fields.items()
+        ]})
 
     def account_id(self):
         return 'operator'
@@ -85,9 +92,8 @@ class MemoryJira(Jira):
             self.lose_comment_kind = None
             raise TransientError('Comment response lost')
 
-    def approve(self, key, author='operator'):
-        proposal = self.comment_items[key][-1]['properties'][0]['value']
-        self.add_comment(key, f'approve {proposal.rsplit(":", 1)[1]}', author=author)
+    def approve(self, key):
+        self.transition(key, self.approval_status, expected=('Open',))
 
     def place_backlog(self, key):
         pass
@@ -95,7 +101,10 @@ class MemoryJira(Jira):
     def transition(self, key, destination, *, expected=None):
         if expected:
             assert self.issue(key)['fields']['status']['name'] in expected
-        self.issue(key)['fields']['status']['name'] = destination
+        status = self.issue(key)['fields']['status']
+        if status['name'] != destination:
+            self.record_change(key, status={'fromString': status['name'], 'toString': destination})
+            status['name'] = destination
 
     def complete(self, key, result):
         if self.fail_complete:
@@ -224,6 +233,7 @@ class EngineTests(EngineCase):
         missing = self.jira.add_ticket('Needs scope', adf(''))
         first = self.jira.add_ticket('Lower priority', adf('Scope'), priority='2')
         second = self.jira.add_ticket('Higher priority', adf('Scope'))
+        self.jira.approve(missing)
         _, _, waiting = self.engine.approved_ticket()
         self.assertIn(f'{missing} waiting for a description', waiting)
         self.assertEqual(self.jira.comment_items[missing], [])
@@ -255,7 +265,7 @@ class EngineTests(EngineCase):
         with patch.object(self.agent, 'recommend', side_effect=concurrent_todo):
             self.engine.cycle()
         self.assertEqual([i['fields']['summary'] for i in self.jira.items], ['New manual ticket', 'First feature'])
-        self.assertEqual([len(self.jira.comment_items[key]) for key in ('APP-1', 'APP-2')], [1, 1])
+        self.assertEqual([len(self.jira.comment_items[key]) for key in ('APP-1', 'APP-2')], [0, 0])
         self.assertEqual(self.jira.completed, [])
 
     def test_blocked_stale_and_ineligible_todo_allow_creation(self):
@@ -267,7 +277,7 @@ class EngineTests(EngineCase):
         for key in (blocked, stale, unmapped, foreign):
             self.jira.approve(key)
         self.jira.issue(blocked)['fields']['labels'].append('self-improver-blocked')
-        self.jira.scope_edits[stale] = 'edited'
+        self.jira.record_change(stale, summary={})
         self.jira.issue(unmapped)['fields']['priority']['id'] = 'unmapped'
         self.jira.issue(foreign)['fields']['labels'].append('self-improver-app-other')
 
@@ -275,12 +285,12 @@ class EngineTests(EngineCase):
 
         self.assertEqual(self.jira.items[-1]['fields']['summary'], 'First feature')
         self.assertEqual(len(self.jira.items), 5)
-        self.assertEqual(len(self.jira.comment_items[stale]), 3)
-        self.assertEqual(len(self.jira.comment_items[blocked]), 2)
+        self.assertEqual(self.jira.issue(stale)['fields']['status']['name'], 'Open')
+        self.assertEqual(self.jira.comment_items[blocked], [])
         self.assertEqual(self.jira.completed, [])
 
     def test_failed_todo_search_prevents_creation(self):
-        with patch.object(self.jira, 'todo', side_effect=[[], TransientError('Search unavailable')]):
+        with patch.object(self.jira, 'ready', side_effect=[[], TransientError('Search unavailable')]):
             with self.assertRaisesRegex(TransientError, 'Search unavailable'):
                 self.engine.cycle()
         self.assertEqual(self.jira.items, [])
@@ -288,7 +298,7 @@ class EngineTests(EngineCase):
 
     def test_multiple_recent_creates_are_checked_during_search_indexing_lag(self):
         manual = self.jira.add_ticket('Indexed manual ticket', adf('Scope'))
-        with patch.object(self.jira, 'todo', return_value=[self.jira.issue(manual)]):
+        with patch.object(self.jira, 'ready', return_value=[self.jira.issue(manual)]):
             self.engine.cycle()
             self.assertEqual(self.state.get('recent_jira_create'), ['APP-2'])
             self.state.set('recent_jira_create', 'APP-2')  # State written by older releases.
@@ -299,41 +309,39 @@ class EngineTests(EngineCase):
             self.assertEqual(self.jira.completed, ['APP-2'])
         self.assertEqual(len(self.jira.items), 3)
         self.assertEqual(self.agent.calls, 2)
-        self.assertEqual(len(self.jira.comment_items['APP-3']), 1)
-        self.engine.project_todo()
-        self.assertEqual(self.state.get('recent_jira_create'), [])
+        self.assertEqual(self.jira.comment_items['APP-3'], [])
+        self.engine.project_ready()
+        self.assertEqual(self.state.get('recent_jira_create'), ['APP-3'])
 
     def test_failed_approval_lookup_prevents_creation(self):
         key = self.jira.add_ticket('Manual ticket', adf('Scope'))
-        with patch.object(self.jira, 'comments', side_effect=TransientError('Comments unavailable')):
-            with self.assertRaisesRegex(TransientError, 'Comments unavailable'):
+        self.jira.approve(key)
+        with patch.object(self.jira, 'changelog', side_effect=TransientError('History unavailable')):
+            with self.assertRaisesRegex(TransientError, 'History unavailable'):
                 self.engine.cycle()
         self.assertEqual([i['key'] for i in self.jira.items], [key])
         self.assertEqual(self.agent.calls, 0)
 
-    def test_wrong_account_and_stale_revision_do_not_authorize_work(self):
-        key = self.jira.add_ticket('Manual', adf('First scope'))
-        self.engine.cycle()
-        self.jira.approve(key, author='someone-else')
-        self.engine.cycle()
-        self.assertEqual(len(self.jira.comment_items[key]), 2)
-        self.jira.comment_items[key].pop()
-        self.jira.approve(key)
-        # Jira records an edit even if the title/description are later restored.
-        self.jira.scope_edits[key] = 'latest-edit'
-        self.engine.cycle()
-        self.assertEqual(len(self.jira.comment_items[key]), 3)
-        self.assertFalse(self.jira.completed)
-        self.jira.approve(key)
-        self.engine.cycle()
-        self.assertEqual(self.jira.completed, [key])
+    def test_scope_edits_require_fresh_approval_even_when_reverted(self):
+        for field in ('summary', 'description'):
+            with self.subTest(field=field):
+                key = self.jira.add_ticket(field, adf('First scope'))
+                self.jira.approve(key)
+                self.jira.record_change(key, **{field: {}})
+                self.jira.record_change(key, **{field: {}})
+                self.engine.cycle()
+                self.assertEqual(self.jira.issue(key)['fields']['status']['name'], 'Open')
+                self.assertNotIn(key, self.jira.completed)
+                self.jira.approve(key)
+                self.engine.cycle()
+                self.assertIn(key, self.jira.completed)
 
     def test_scope_change_or_withdrawal_before_merge_preserves_worktree(self):
         base = self.repo.head()
         review = self.agent.review
         changes = {
             'edited': lambda key: self.jira.issue(key)['fields'].update(description=adf('New scope')),
-            'withdrawn': lambda key: self.jira.comment_items[key].pop(),
+            'withdrawn': lambda key: self.jira.transition(key, 'Open'),
             'moved': lambda key: self.jira.transition(key, 'Cancelled'),
             'deleted': lambda key: self.jira.items.remove(self.jira.issue(key)),
             'blocked': lambda key: self.jira.issue(key)['fields']['labels'].append('self-improver-blocked'),
@@ -361,11 +369,7 @@ class EngineTests(EngineCase):
         self.assertEqual(self.state.get('last_cycle')['outcome'], 'approval interrupted')
 
     def test_lost_comment_responses_reconcile_without_duplicates(self):
-        self.jira.lose_comment_kind = 'approval'
-        with self.assertRaises(TransientError):
-            self.engine.cycle()
-        self.engine.cycle()
-        self.jira.approve('APP-1')
+        self.create_and_approve()
         self.jira.lose_comment_kind = 'done'
         with self.assertRaises(TransientError):
             self.engine.cycle()
@@ -375,11 +379,12 @@ class EngineTests(EngineCase):
         self.assertEqual(self.repo.head(), merged)
         self.assertEqual(self.jira.completed, ['APP-1'])
         comments = self.jira.comment_items['APP-1']
-        self.assertEqual(len(comments), 3)
+        self.assertEqual(len(comments), 1)
         self.assertIn('implemented', json.dumps(comments[-1]['body']))
         self.assertIn('test: passed', json.dumps(comments[-1]['body']))
 
     def test_unconfirmed_comment_waits_for_operator_before_retry(self):
+        self.create_and_approve()
         with patch.object(self.jira, 'add_comment', side_effect=TransientError('Connection lost')) as post:
             with self.assertRaises(TransientError):
                 self.engine.cycle()

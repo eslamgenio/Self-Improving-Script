@@ -17,7 +17,7 @@ from improver.cli import main
 from improver.core import Config, Runner, State, TransientError
 from improver.engine import Engine
 from improver.git import Repository
-from improver.jira import Jira, adf
+from improver.jira import Jira
 from test_git_agent import make_repo, git
 
 
@@ -28,6 +28,16 @@ def server():
         limited = False
         requests_seen = []
         comments = {}
+        history = {}
+
+        @classmethod
+        def transition(cls, issue, name):
+            history = cls.history.setdefault(issue['key'], [])
+            previous = issue['fields']['status']['name']
+            history.append({'id': str(len(history) + 1), 'items': [
+                {'fieldId': 'status', 'fromString': previous, 'toString': name}
+            ]})
+            issue['fields']['status'] = {'name': name, 'statusCategory': {'key': 'done' if name == 'Done' else 'indeterminate'}}
 
         def log_message(self, *args):
             pass
@@ -44,8 +54,8 @@ def server():
                 return
             if self.path.endswith('/search/jql'):
                 selected = self.items
-                if 'status = "Open"' in body.get('jql', ''):
-                    selected = [i for i in selected if i['fields']['status']['name'] == 'Open']
+                if 'status = "Ready for Automation"' in body.get('jql', ''):
+                    selected = [i for i in selected if i['fields']['status']['name'] == 'Ready for Automation']
                 if 'self-improver-fp-' in body.get('jql', ''):
                     selected = [i for i in selected if any(label in body['jql'] for label in i['fields']['labels'] if 'fp-' in label)]
                 result = {'issues': selected, 'isLast': True}
@@ -68,7 +78,10 @@ def server():
                     comments.append(result)
                     status = 201
             elif '/changelog' in self.path:
-                result = {'values': [], 'total': 0, 'isLast': True}
+                key = self.path.split('/issue/')[1].split('/')[0]
+                entries = self.history.get(key, [])
+                start = int(parse_qs(urlsplit(self.path).query)['startAt'][0])
+                result = {'values': entries[start:start + 1], 'total': len(entries)}
             elif '/board/1/issue' in self.path:
                 result = {'issues': self.items}
             elif '/backlog/' in self.path:
@@ -81,7 +94,7 @@ def server():
                                               for name in ('Open', 'Working', 'Done')]}
                 else:
                     name = body['transition']['id']
-                    issue['fields']['status'] = {'name': name, 'statusCategory': {'key': 'done' if name == 'Done' else 'indeterminate'}}
+                    self.transition(issue, name)
                     status = 204
             elif '/properties/' in self.path:
                 status = 204
@@ -146,12 +159,12 @@ class IntegrationTests(unittest.TestCase):
                 jira.opener = opener
                 engine = Engine(cfg, repo, state, jira, agent, runner)
                 def approve(key):
-                    revision = handler.comments[key][-1]['properties'][0]['value'].rsplit(':', 1)[1]
-                    handler.comments[key].append({'id': 'operator-approval', 'author': {'accountId': 'operator'},
-                                                  'body': adf(f'approve {revision}')})
+                    issue = next(i for i in handler.items if i['key'] == key)
+                    handler.transition(issue, 'Ready for Automation')
                 original = repo.head()
                 engine.cycle()
                 self.assertEqual(original, repo.head())
+                self.assertFalse(any('/comment' in path for _, path, _ in handler.requests_seen))
                 approve('APP-1')
                 engine.cycle()
                 first = repo.head()

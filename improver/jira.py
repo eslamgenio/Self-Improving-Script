@@ -31,19 +31,6 @@ def has_description(value):
     return False
 
 
-def approval_text(body):
-    """Read a standalone text paragraph, excluding quotes and code blocks."""
-    if not isinstance(body, dict) or body.get('type') != 'doc':
-        return ''
-    paragraphs = body.get('content', [])
-    if len(paragraphs) != 1 or paragraphs[0].get('type') != 'paragraph':
-        return ''
-    nodes = paragraphs[0].get('content', [])
-    if any(node.get('type') != 'text' for node in nodes):
-        return ''
-    return ''.join(node.get('text', '') for node in nodes).strip()
-
-
 def adf(text):
     return {'type': 'doc', 'version': 1, 'content': [
         {'type': 'paragraph', 'content': [{'type': 'text', 'text': line}]} if line else
@@ -146,8 +133,12 @@ class Jira:
                 raise TransientError('Jira repeated a pagination token.')
             seen.add(token)
 
-    def todo(self):
-        status = json.dumps(self.settings['statuses']['backlog'], ensure_ascii=False)
+    @property
+    def approval_status(self):
+        return self.settings['statuses'].get('approved', 'Ready for Automation')
+
+    def ready(self):
+        status = json.dumps(self.approval_status, ensure_ascii=False)
         return self.issues(f'status = {status}', project_wide=True)
 
     def issue(self, key):
@@ -159,24 +150,46 @@ class Jira:
         if self._account_id is None:
             self._account_id = self.request('GET', '/rest/api/3/myself').get('accountId')
             if not self._account_id:
-                raise ConfigError('Jira did not identify the authenticated account for scope approval.')
+                raise ConfigError('Jira did not identify the authenticated account.')
         return self._account_id
 
-    def last_field_edit(self, key, fields):
+    def changelog(self, key):
         # Jira returns issue changelogs in date order, oldest first.
-        latest, start = None, 0
+        start = 0
         while True:
             page = self.request('GET', f'/rest/api/3/issue/{key}/changelog?startAt={start}&maxResults=100')
             entries = page['values']
-            for entry in entries:
-                if any((change.get('fieldId') or change.get('field')) in fields
-                       for change in entry['items']):
-                    latest = entry['id']
+            yield from entries
             start += len(entries)
             if page.get('isLast') or start >= page['total']:
-                return latest
+                return
             if not entries:
                 raise TransientError(f'{key}: Jira changelog pagination did not advance.')
+
+    def last_field_edit(self, key, fields):
+        latest = None
+        for entry in self.changelog(key):
+            if any((change.get('fieldId') or change.get('field')) in fields for change in entry['items']):
+                latest = entry['id']
+        return latest
+
+    def scope_approval(self, key):
+        """Return the approval event still valid at the end of Jira's history."""
+        statuses = self.settings['statuses']
+        ready, working = self.approval_status, statuses['in_progress']
+        approval, current = None, None
+        for entry in self.changelog(key):
+            fields = {change.get('fieldId') or change.get('field'): change for change in entry['items']}
+            if 'status' in fields:
+                change = fields['status']
+                previous, current = change.get('fromString'), change.get('toString')
+                if previous == statuses['backlog'] and current == ready:
+                    approval = str(entry['id'])
+                elif (previous, current) != (ready, working):
+                    approval = None
+            if fields.keys() & {'summary', 'description'}:
+                approval = None
+        return approval, current
 
     def comments(self, key):
         start = 0
@@ -199,13 +212,6 @@ class Jira:
         return any(comment.get('author', {}).get('accountId') == self.account_id()
                    and any(prop['key'] == COMMENT_MARKER and prop['value'] in (marker, {'marker': marker})
                            for prop in comment.get('properties', [])) for comment in comments)
-
-    def approval(self, comments, revision):
-        account = self.account_id()
-        return next((str(comment['id']) for comment in comments
-                     if comment.get('author', {}).get('accountId') == account
-                     and comment.get('updateAuthor', comment['author']).get('accountId') == account
-                     and approval_text(comment['body']) == f'approve {revision}'), None)
 
     def select(self, issues):
         priorities = self.settings['priorities']
@@ -301,12 +307,15 @@ class Jira:
         statuses = self.settings.get('statuses', {})
         if not all(statuses.get(s) for s in ('backlog', 'in_progress', 'done')):
             raise ConfigError('Map backlog, in_progress and done to Jira status names.')
+        required_statuses = {*statuses.values(), self.approval_status}
+        if not self.approval_status or self.approval_status in {statuses[s] for s in ('backlog', 'in_progress', 'done')}:
+            raise ConfigError('The Jira approval status must be distinct from backlog, in progress and done.')
         workflows = self.request('GET', f'/rest/api/3/project/{quote(project)}/statuses')
         for type_id in set(types.values()):
             records = [w for w in workflows if str(w['id']) == str(type_id)]
             available = {s['name'] for w in records for s in w.get('statuses', [])}
-            if set(statuses.values()) - available:
-                raise ConfigError(f'Issue type {type_id} lacks configured statuses: {set(statuses.values()) - available}')
+            if required_statuses - available:
+                raise ConfigError(f'Issue type {type_id} lacks configured statuses: {required_statuses - available}')
             endpoint = f'/rest/api/3/issue/createmeta/{project}/issuetypes/{type_id}'
             fields, start = [], 0
             while True:

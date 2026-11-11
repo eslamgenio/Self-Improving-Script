@@ -26,11 +26,11 @@ class JiraTests(unittest.TestCase):
         comment['properties'] = [{'key': COMMENT_MARKER, 'value': marker}]
         self.assertTrue(client.comment_exists([comment], marker))
 
-    def test_todo_query_is_project_wide_even_for_manually_created_issues(self):
+    def test_ready_query_is_project_wide_even_for_manually_created_issues(self):
         transport = FakeTransport([{'issues': [{'key': 'X-1'}], 'isLast': True}])
         client = Jira(Config(jira={'project': 'X', 'statuses': {'backlog': 'To Do'}}), transport=transport)
-        self.assertEqual(client.todo(), [{'key': 'X-1'}])
-        self.assertEqual(transport.calls[0][2]['jql'], 'project = "X" AND (status = "To Do")')
+        self.assertEqual(client.ready(), [{'key': 'X-1'}])
+        self.assertEqual(transport.calls[0][2]['jql'], 'project = "X" AND (status = "Ready for Automation")')
 
     def test_changelog_pages_detect_scope_edits_without_confusing_status_changes(self):
         transport = FakeTransport([

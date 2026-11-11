@@ -85,12 +85,8 @@ class Engine:
                 if item['kind'] == 'backlog':
                     self.jira.place_backlog(item['key'])
                 elif item['kind'] == 'scope':
-                    ticket = self.jira.issue(item['key'])
-                    if ticket['key'] == item['key'] and self.scope_revision(ticket) == item['revision']:
-                        if not self.is_todo(ticket) or not self.selectable(ticket):
-                            continue
-                        self.deliver_comment(identity, item, f'Review the current title and description, then reply with:\n'
-                                             f'approve {item["revision"]}')
+                    # Acknowledge obsolete approval requests left by older versions.
+                    pass
                 elif item['kind'] == 'done':
                     result = item['result']
                     checks = '\n'.join(f'- {check["name"]}: {"passed" if check["code"] == 0 else "failed"}'
@@ -127,17 +123,14 @@ class Engine:
         item['comment_delivered'] = True
         self.state.update_pending(identity, item)
 
-    def is_todo(self, ticket):
-        return ticket['fields']['status']['name'] == self.config.jira['statuses']['backlog']
-
     def recent_jira_creates(self):
         recent = self.state.get('recent_jira_create')
         if isinstance(recent, str):
             return [recent]
         return recent or []
 
-    def project_todo(self):
-        issues = list(self.jira.todo())
+    def project_ready(self):
+        issues = list(self.jira.ready())
         indexed = {ticket['key'] for ticket in issues}
         recent = self.recent_jira_creates()
         unindexed = []
@@ -148,8 +141,12 @@ class Engine:
                 ticket = self.jira.issue(key)
             except JiraNotFound:
                 continue
-            if ticket['key'] == key and self.is_todo(ticket):
+            if ticket['key'] != key:
+                continue
+            status = ticket['fields']['status']['name']
+            if status == self.jira.approval_status:
                 issues.append(ticket)
+            if status in (self.config.jira['statuses']['backlog'], self.jira.approval_status):
                 unindexed.append(key)
         if unindexed != recent:
             self.state.set('recent_jira_create', unindexed)
@@ -171,7 +168,7 @@ class Engine:
                             'No create retry will be made. Check Jira, then use resolve-create.', 60)
                     record['key'] = matches[0]['key']
                 else:
-                    if created or self.approved_ticket(request_approval=False)[0]:
+                    if created or self.approved_ticket(reset_stale=False)[0]:
                         # A later cycle can reconsider recommendations that were never submitted.
                         records.pop(fingerprint)
                         self.state.set('recommendations', records)
@@ -227,70 +224,67 @@ class Engine:
         self.checkpoint(cycle, 'publish')
         return cycle
 
-    def scope_revision(self, ticket):
+    def scope_digest(self, ticket):
         fields = ticket['fields']
-        scope = [fields['summary'], fields.get('description'), self.jira.last_field_edit(ticket['key'], {'summary', 'description'})]
-        digest = hashlib.sha256(canonical(scope).encode()).hexdigest()
-        identity = f'scope:{ticket.get("id", ticket["key"])}'
-        record = self.state.get(identity, {})
-        if record.get('digest') != digest:
-            record = {'digest': digest, 'revision': uuid.uuid4().hex[:12]}
-            self.state.set(identity, record)
-        return record['revision']
+        scope = [fields['summary'], fields.get('description')]
+        return hashlib.sha256(canonical(scope).encode()).hexdigest()
 
     def selectable(self, ticket):
         labels = ticket['fields'].get('labels', [])
         return BLOCKED_LABEL not in labels and all(
             label == self.jira.label for label in labels if label.startswith('self-improver-app-'))
 
-    def approved_ticket(self, *, request_approval=True):
+    def return_for_approval(self, key, status):
+        try:
+            self.jira.transition(key, self.config.jira['statuses']['backlog'], expected=(status,))
+        except Blocked:
+            # A concurrent status change already took the ticket out of this state.
+            pass
+
+    def approved_ticket(self, *, reset_stale=True):
         approved, approvals, waiting = [], {}, []
-        for match in self.project_todo():
+        ready = self.jira.approval_status
+        for match in self.project_ready():
             try:
                 ticket = self.jira.issue(match['key'])
-                if ticket['key'] != match['key'] or not self.is_todo(ticket) or not self.selectable(ticket):
+                if (ticket['key'] != match['key'] or ticket['fields']['status']['name'] != ready
+                        or not self.selectable(ticket)):
                     continue
                 key, fields = ticket['key'], ticket['fields']
-                revision = self.scope_revision(ticket)
+                event, history_status = self.jira.scope_approval(key)
+                if not event or history_status != ready:
+                    if reset_stale and history_status == ready:
+                        self.return_for_approval(key, ready)
+                    waiting.append(f'{key} waiting for a fresh approval')
+                    continue
                 if not has_description(fields.get('description')):
                     waiting.append(f'{key} waiting for a description')
                     continue
                 if (fields.get('priority') or {}).get('id') not in self.config.jira['priorities']:
                     waiting.append(f'{key} has an unmapped Jira priority')
                     continue
-                identity = f'approval:{key}:{revision}'
-                comments = list(self.jira.comments(key))
-                marker = f'{self.config.app_id}:{identity}'
-                if self.jira.comment_exists(comments, marker):
-                    approval = self.jira.approval(comments, revision)
-                    if approval:
-                        approvals[key] = {'revision': revision, 'comment': approval}
-                        approved.append(ticket)
-                        continue
-                if request_approval:
-                    self.state.enqueue(identity, {'kind': 'scope', 'key': key, 'revision': revision})
-                    waiting.append(f'{key} waiting for approval')
+                approvals[key] = {'event': event, 'scope': self.scope_digest(ticket)}
+                approved.append(ticket)
             except JiraNotFound:
                 continue
-        if request_approval:
-            self.flush()
         selected = self.jira.select(approved)
         return selected, approvals.get(selected['key']) if selected else None, waiting
 
     def require_approval(self, cycle, *statuses):
         key = cycle['key']
-        approval = cycle.get('approval')
-        if not approval:
+        approval = cycle.get('approval') or {}
+        if not approval.get('event'):
             raise ApprovalChanged(f'{key}: return the ticket to To Do and approve its scope.')
         try:
             ticket = self.jira.issue(key)
-            if ticket['key'] != key or not self.selectable(ticket) or ticket['fields']['status']['name'] not in statuses:
+            status = ticket['fields']['status']['name']
+            if ticket['key'] != key or not self.selectable(ticket) or status not in statuses:
                 raise ApprovalChanged(f'{key}: Jira status or labels no longer allow work.')
-            if self.scope_revision(ticket) != approval['revision']:
-                raise ApprovalChanged(f'{key}: scope changed. Return the ticket to To Do and approve the new revision.')
-            comments = (c for c in self.jira.comments(key) if str(c['id']) == approval['comment'])
-            if not self.jira.approval(comments, approval['revision']):
-                raise ApprovalChanged(f'{key}: approval withdrawn. Return the ticket to To Do and approve its scope.')
+            event, history_status = self.jira.scope_approval(key)
+            if history_status != status or event != approval['event'] or self.scope_digest(ticket) != approval['scope']:
+                if history_status == status and (not event or event == approval['event']):
+                    self.return_for_approval(key, status)
+                raise ApprovalChanged(f'{key}: scope or approval changed. A fresh approval is required for a new run.')
         except JiraNotFound as exc:
             raise ApprovalChanged(f'{key}: Jira issue was deleted or is no longer visible.') from exc
         return {'key': key, 'fields': {name: ticket['fields'].get(name) for name in ('summary', 'description')}}
@@ -360,7 +354,7 @@ class Engine:
             return
         statuses = self.config.jira['statuses']
         if cycle['phase'] == 'baseline':
-            self.require_approval(cycle, statuses['backlog'])
+            self.require_approval(cycle, self.jira.approval_status)
             try:
                 self.repo.require_clean(self.config.target_branch)
                 if self.repo.head() != cycle['base']:
@@ -374,11 +368,11 @@ class Engine:
                 work = self.repo.worktree(cycle['work_name'], cycle['base'])
                 self.checkpoint(cycle, 'starting', baseline_evidence=evidence, work=str(work), feedback='')
             except Blocked as exc:
-                self.require_approval(cycle, statuses['backlog'])
+                self.require_approval(cycle, self.jira.approval_status)
                 self.block(cycle, exc)
                 return
         if cycle['phase'] == 'starting':
-            expected = [statuses['backlog']]
+            expected = [self.jira.approval_status]
             if cycle.get('transition_attempted'):
                 expected.append(statuses['in_progress'])
             self.require_approval(cycle, *expected)
