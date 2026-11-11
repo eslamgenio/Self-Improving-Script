@@ -11,7 +11,8 @@ application purpose. Ambiguous product decisions block the ticket.
 
 ## Prerequisites
 
-- Python **3.12+**. On this Windows machine use `py -3`; the `python` alias is broken.
+- Python **3.12 or later** for the CLI. The Windows `setup-scrum.ps1` launcher
+  requires Python **3.12** specifically because it calls `py -3.12`.
 - Git, with `user.name` and `user.email` configured.
 - Codex CLI, authenticated with `codex login`. For the npm installation, Node.js
   must be available. The installed CLI must support `exec --output-schema`,
@@ -29,9 +30,13 @@ uses the account/model configured in your CLI and is subject to its usage limits
 
 ## Set up the SCRUM application on another Windows machine
 
-Copy this tool's whole folder and clone the application repository. Keep its
-`main` branch clean and checked out. Have Python 3.12, Git, a signed-in Codex CLI,
-and Docker Desktop running in Linux container mode.
+`setup-scrum.ps1` targets `ishussien.atlassian.net`, Jira project `SCRUM`, and
+board `1`. For another Jira site, project, or board, follow the
+[direct CLI instructions](#start-from-an-application-directory).
+
+Clone this tool and the application repository. Keep the application's `main`
+branch clean and checked out. Have Python 3.12, Git, a signed-in Codex CLI, and
+Docker Desktop running in Linux container mode.
 
 From the tool folder, run:
 
@@ -43,12 +48,14 @@ The launcher uses the saved application path, Atlassian sign-in email, and API
 token automatically. It initializes the SCRUM board 1 mappings on a fresh clone
 and reuses that configuration on later runs.
 
-The launcher reads and saves `setup-scrum.json` beside `setup-scrum.ps1`. You can
-edit `application_path`, `jira_email`, and `jira_api_token` in the file before
-running the launcher. Use an absolute path with forward slashes or doubled
-backslashes in JSON. The token is stored in plain text, and `.gitignore` excludes
-the file from Git. Keep the file private. If you enter the token at the masked
-prompt, the launcher saves it only after `doctor` passes.
+On a fresh clone, run the launcher and enter any values it prompts for. After
+`doctor` passes, the launcher creates `setup-scrum.json` beside `setup-scrum.ps1`.
+Choose `3` if you only want to finish setup.
+
+For later runs, edit `application_path`, `jira_email`, and `jira_api_token` in
+that file. Use an absolute path with forward slashes or doubled backslashes in
+JSON. The token is stored in plain text, and `.gitignore` excludes the file from
+Git. Keep it private. The token prompt masks input.
 
 If the saved path is blank, the launcher checks the current Git repository and
 then the neighboring `Self-Improving App` folder for a matching configuration.
