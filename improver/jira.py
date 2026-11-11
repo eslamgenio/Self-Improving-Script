@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-from .core import Blocked, ConfigError, TransientError, canonical, redact
+from .core import Blocked, ConfigError, RECOMMENDATION_KINDS, TransientError, canonical, redact
 
 
 ORIGIN = 'self-improver'
@@ -228,12 +228,16 @@ class Jira:
                                            i['fields']['created'], i['key'])) if eligible else None
 
     def create(self, rec, fingerprint, base):
+        category = rec.get('category')
+        kind = RECOMMENDATION_KINDS[category] if category else rec['kind']
         fields = dict(self.settings.get('custom_fields', {}))
         fields.update({'project': {'key': self.settings['project']}, 'summary': rec['title'],
                        'description': issue_description(rec, base),
-                       'issuetype': {'id': self.settings['issue_types'][rec['kind']]},
+                       'issuetype': {'id': self.settings['issue_types'][kind]},
                        'priority': {'id': self.settings['priorities'][rec['priority_rank']]},
                        'labels': [ORIGIN, self.label, f'self-improver-fp-{fingerprint}']})
+        if category:
+            fields['labels'].append(category)
         if rec.get('dependencies'):
             fields['labels'].append(BLOCKED_LABEL)
         return self.request('POST', '/rest/api/3/issue', {'fields': fields})['key']

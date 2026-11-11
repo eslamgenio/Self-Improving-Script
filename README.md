@@ -1,8 +1,8 @@
 # Application Self-Improver
 
 A Python controller that reviews an application's source with Codex CLI, creates
-a Jira Cloud backlog ticket when the automation queue has no eligible work,
-and implements the highest-priority eligible ticket in a Git worktree. It verifies
+up to three Jira Cloud backlog tickets per cycle, and implements the
+highest-priority eligible ticket in a Git worktree. It verifies
 the change and fast-forwards the local target branch.
 It repeats five minutes after each cycle until you press Ctrl+C.
 
@@ -189,16 +189,26 @@ The installed command is `self-improve`, with the same arguments.
 Tickets enter the automation queue when a reviewer moves them from **To Do**
 to **Ready for Automation**. An eligible ticket also needs a description and a
 mapped priority. The controller excludes tickets labeled `self-improver-blocked`
-and tickets assigned to another application. When no ticket qualifies, it can
-create one To Do ticket per cycle and checks the ready queue again just before
-creating it.
+and tickets assigned to another application. Each new cycle can create up to
+three **To Do** tickets before selecting approved work, even when approved work
+is already waiting. Each category can contribute one ticket. Jira labels are `UI` for visual
+presentation, `Feature` for a new capability, and `UX` for improving an existing
+workflow or interaction. UI and UX use the configured improvement issue type.
+Feature uses the configured feature issue type.
 
-If every recommendation matches existing work, the controller gives Codex the
-matching Jira ticket keys and asks once for different suggestions in the same
-cycle. If the retry yields no new candidate, the cycle publishes nothing.
-For example, if a suggestion matches SCRUM-11, the launcher reports that match
-before asking Codex for alternatives. The one-ticket limit still applies if the
-retry returns several new suggestions.
+If any categories are missing, the controller asks Codex once for suggestions
+in those categories. It includes accepted suggestions and matching Jira ticket
+keys for duplicates when available. It publishes valid suggestions and reports
+the ticket key or missing suggestion for each category.
+
+For example, a cycle that finds UI and Feature work reports:
+
+```text
+Jira ticket batch: UI: APP-41, Feature: APP-42, UX: no suitable suggestion
+```
+
+If a Jira create response is lost partway through a batch, the next run
+reconciles the saved fingerprint and resumes the batch.
 
 1. Open a To Do ticket and write the scope and acceptance criteria in the
    description. Review the title and description, then move the ticket to
@@ -352,7 +362,6 @@ This is a source-repository improvement tool, not a guarantee that arbitrary
 applications improve. Review quality depends on Codex, documentation and tests.
 Exact-title/fingerprint duplicates are rejected deterministically; semantic
 duplicates are also checked by the review agent and remain a model judgment.
-Each cycle can add at most one ticket, and any visible To Do ticket pauses creation.
 Model context contains up to 200 prioritized open-ticket excerpts and 200 recent
 historical summaries; deterministic duplicate detection and ticket selection
 still inspect the full backlog. Source inventory is capped at 10,000 eligible

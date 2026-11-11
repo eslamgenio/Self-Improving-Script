@@ -83,6 +83,18 @@ class JiraTests(unittest.TestCase):
         self.assertEqual(fields['description']['type'], 'doc')
         self.assertIn('self-improver-fp-abc', fields['labels'])
 
+    def test_categories_add_exact_labels_and_select_configured_issue_types(self):
+        cfg = Config(jira={'project': 'X', 'priorities': ['1'],
+                           'issue_types': {'feature': '10', 'improvement': '20'}})
+        transport = FakeTransport([{'key': 'X-1'}, {'key': 'X-2'}, {'key': 'X-3'}])
+        client = Jira(cfg, transport=transport)
+        for category, type_id in (('UI', '20'), ('Feature', '10'), ('UX', '20')):
+            with self.subTest(category=category):
+                client.create({'title': category, 'category': category, 'priority_rank': 0}, 'abc', 'commit')
+                fields = transport.calls[-1][2]['fields']
+                self.assertEqual(fields['issuetype'], {'id': type_id})
+                self.assertEqual(fields['labels'], ['self-improver', client.label, 'self-improver-fp-abc', category])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import uuid
 
 from .agent import validate_commands, validate_recommendations, validate_schema, IMPLEMENT_SCHEMA, REVIEW_SCHEMA
-from .core import Blocked, ConfigError, TransientError, canonical, recommendation_id, redact
+from .core import Blocked, ConfigError, RECOMMENDATION_KINDS, TransientError, canonical, recommendation_id, redact
 from .jira import BLOCKED_LABEL, JiraNotFound, has_description, issue_description
 
 
@@ -170,7 +170,7 @@ class Engine:
                             'No create retry will be made. Check Jira, then use resolve-create.', 60)
                     record['key'] = matches[0]['key']
                 else:
-                    if created or self.approved_ticket(reset_stale=False)[0]:
+                    if 'categories' not in cycle and (created or self.approved_ticket(reset_stale=False)[0]):
                         # A later cycle can reconsider recommendations that were never submitted.
                         records.pop(fingerprint)
                         self.state.set('recommendations', records)
@@ -189,57 +189,70 @@ class Engine:
             created = True
             self.state.enqueue(f'backlog:{record["key"]}', {'kind': 'backlog', 'key': record['key']})
         self.flush()
+        if 'categories' in cycle:
+            tickets = {records[fp]['recommendation']['category']: records[fp]['key']
+                       for fp in cycle['fingerprints']}
+            summary = ', '.join(f'{category}: {tickets.get(category, "no suitable suggestion")}'
+                                for category in cycle['categories'])
+            print(f'Jira ticket batch: {summary}', flush=True)
 
     def new_cycle(self):
-        if self.approved_ticket()[0]:
-            cycle = {'id': uuid.uuid4().hex[:12], 'base': self.repo.head()}
-            self.checkpoint(cycle, 'select')
-            return cycle
         context = self.repo.context()
         backlog = self.jira.issues(project_wide=True)
         records = self.state.get('recommendations', {})
         backlog_context = self.backlog_context(backlog, records)
-        titles = {}
+        titles, jira_fingerprints = {}, {}
         for issue in backlog:
             title = ' '.join(issue['fields']['summary'].casefold().split())
             titles.setdefault(title, set()).add(issue['key'])
+            for label in issue['fields'].get('labels', []):
+                if label.startswith('self-improver-fp-'):
+                    jira_fingerprints.setdefault(label.removeprefix('self-improver-fp-'), set()).add(issue['key'])
         for record in records.values():
             title = ' '.join(record['recommendation']['title'].casefold().split())
             keys = titles.setdefault(title, set())
             if record.get('key'):
                 keys.add(record['key'])
 
-        fingerprints = []
+        categories = list(RECOMMENDATION_KINDS)
+        selected = {}
+        duplicates = []
         for attempt in range(2):
-            result = self.agent.recommend(context, backlog_context, self.config.jira['priorities'], self.repo.root)
+            missing = [category for category in categories if category not in selected]
+            if not missing:
+                break
+            if attempt:
+                print(f'Asking Codex for remaining Jira categories: {", ".join(missing)}.', flush=True)
+            request_context = {**backlog_context, 'requested_categories': missing,
+                               'accepted_recommendations': [
+                                   {'title': records[fp]['recommendation']['title'], 'category': category}
+                                   for category, fp in selected.items()
+                               ], 'duplicate_recommendations': list(duplicates)}
+            result = self.agent.recommend(context, request_context, self.config.jira['priorities'], self.repo.root)
             recs = validate_recommendations(result, len(self.config.jira['priorities']))
-            duplicates = []
             for rec in sorted(recs, key=lambda rec: rec['priority_rank']):
+                category = rec['category']
+                if category not in missing or category in selected:
+                    continue
                 title = ' '.join(rec['title'].casefold().split())
-                # Line-number movement must not make an otherwise identical recommendation new.
+                # Ignore source line changes when checking recommendation identity.
                 evidence_tokens = re.sub(r':\d+(?:[-:]\d+)?', '', rec['evidence'][0]).split()
                 evidence = evidence_tokens[0] if evidence_tokens else ''
                 fingerprint = recommendation_id(title, evidence)
-                if title in titles or fingerprint in records:
-                    keys = set(titles.get(title, ()))
+                if title in titles or fingerprint in records or fingerprint in jira_fingerprints:
+                    keys = titles.get(title, set()) | jira_fingerprints.get(fingerprint, set())
                     if records.get(fingerprint, {}).get('key'):
                         keys.add(records[fingerprint]['key'])
                     duplicates.append({'title': rec['title'], 'matching_jira_tickets': sorted(keys)})
                     continue
                 if not any(any(path in entry for path in context['files']) for entry in rec['evidence']):
-                    raise Blocked(f'Recommendation has no source evidence: {rec["title"]}')
+                    continue
                 records[fingerprint] = {'recommendation': rec, 'base': context['commit'],
                                         'attempted': False, 'sequence': len(records)}
-                fingerprints.append(fingerprint)
-                break
-            if fingerprints or not duplicates or attempt == 1 or self.approved_ticket(reset_stale=False)[0]:
-                break
-            matches = sorted({key for duplicate in duplicates for key in duplicate['matching_jira_tickets']})
-            match_text = ', '.join(matches) if matches else 'local recommendation history'
-            print(f'All recommendations matched existing work ({match_text}). Asking Codex for alternatives.',
-                  flush=True)
-            backlog_context = {**backlog_context, 'duplicate_recommendations': duplicates}
-        cycle = {'id': uuid.uuid4().hex[:12], 'base': context['commit'], 'fingerprints': fingerprints}
+                titles[title] = set()
+                selected[category] = fingerprint
+        cycle = {'id': uuid.uuid4().hex[:12], 'base': context['commit'], 'categories': categories,
+                 'fingerprints': [selected[category] for category in categories if category in selected]}
         # Recommendations and the publish checkpoint must become durable together.
         cycle['phase'] = 'publish'
         self.state.set_many({'recommendations': records, 'cycle': cycle})

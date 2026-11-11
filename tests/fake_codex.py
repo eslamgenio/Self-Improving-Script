@@ -7,7 +7,7 @@ import sys
 
 
 def recommendation(title, rank):
-    return dict(title=title, kind='feature', priority_rank=rank, priority_reason='Fixture priority',
+    return dict(title=title, category='Feature', kind='feature', priority_rank=rank, priority_reason='Fixture priority',
                 business_value='Helpful user interaction', current_behavior='Interaction missing',
                 desired_behavior='Interaction returns expected text', evidence=['app.py:1'],
                 acceptance_criteria=['Interaction returns exact expected message'],
@@ -40,7 +40,7 @@ def main():
     if phase == 'discover':
         result = {'setup': [], 'checks': checks(), 'reason': 'Fixture test/runtime commands'}
     elif phase == 'recommend':
-        result = {'recommendations': [recommendation('Add greeting', 0), recommendation('Add farewell', 1)]
+        result = {'recommendations': [recommendation('Add greeting', 0)]
                   if 'def greeting' not in (cwd / 'app.py').read_text()
                   else [recommendation('Add greeting', 0), recommendation('Add shout', 2)], 'notes': 'fixture'}
     elif phase == 'implement':

@@ -34,6 +34,12 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
+RECOMMENDATION_KINDS = {'UI': 'improvement', 'Feature': 'feature', 'UX': 'improvement'}
+
+
+RECOMMENDATION_KINDS = {'UI': 'improvement', 'Feature': 'feature', 'UX': 'improvement'}
+
+
 def recommendation_id(title, evidence):
     normalized = ' '.join(f'{title} {evidence}'.casefold().split())
     return hashlib.sha256(normalized.encode()).hexdigest()[:24]

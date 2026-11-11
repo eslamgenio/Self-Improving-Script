@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import uuid
 
-from .core import Blocked, ConfigError, TransientError, canonical
+from .core import Blocked, ConfigError, RECOMMENDATION_KINDS, TransientError, canonical
 
 
 def obj(properties):
@@ -19,6 +19,7 @@ COMMANDS = {'type': 'array', 'items': COMMAND}
 CHECK = obj({'name': STRING, 'kind': {'type': 'string', 'enum': ['test', 'lint', 'build', 'runtime']}, 'argv': COMMAND})
 COMMAND_SCHEMA = obj({'setup': COMMANDS, 'checks': {'type': 'array', 'items': CHECK}, 'reason': STRING})
 REC_FIELDS = {'title': STRING, 'kind': {'type': 'string', 'enum': ['bug', 'improvement', 'feature']},
+              'category': {'type': 'string', 'enum': list(RECOMMENDATION_KINDS)},
               'priority_rank': {'type': 'integer', 'minimum': 0}, 'priority_reason': STRING,
               'business_value': STRING, 'current_behavior': STRING, 'desired_behavior': STRING,
               'evidence': STRINGS, 'acceptance_criteria': STRINGS, 'implementation': STRINGS,
@@ -89,6 +90,8 @@ def validate_recommendations(value, priority_count):
                 raise Blocked(f'Invalid recommendation {key}.')
         if rec['kind'] not in {'bug', 'improvement', 'feature'}:
             raise Blocked('Unknown ticket kind.')
+        if rec['category'] not in RECOMMENDATION_KINDS:
+            raise Blocked('Unknown recommendation category.')
         if type(rec['priority_rank']) is not int or not 0 <= rec['priority_rank'] < priority_count:
             raise Blocked('Recommendation priority is outside configured ordering.')
         for key in ('evidence', 'acceptance_criteria', 'implementation', 'skills', 'validation'):
@@ -195,7 +198,11 @@ Use Windows/PowerShell compatible commands on Windows. No live integrations or m
 
     def recommend(self, context, backlog, priorities, cwd):
         prompt = f'''PHASE recommend. Review the current application code and documentation.
-Suggest 0–3 evidence-backed, independently actionable, nonduplicate improvements.
+Suggest at most one evidence-backed, independently actionable recommendation per category.
+UI improves visual presentation. Feature adds a new capability. UX improves an existing
+workflow or interaction. Use improvement as kind for UI and UX, and feature for Feature.
+If requested_categories is supplied, suggest work only for those categories. Avoid overlap
+with accepted_recommendations and omit categories without suitable work.
 Prioritize product growth and user experience grounded in the documented application purpose;
 critical security/data-loss/correctness issues outrank other work. Defer ambiguous product choices.
 priority_rank indexes the following ordered Jira priority IDs (0 highest): {canonical(priorities)}.

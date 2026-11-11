@@ -16,8 +16,8 @@ from improver.jira import COMMENT_MARKER, Jira, JiraNotFound, adf, issue_descrip
 from test_git_agent import git, make_repo
 
 
-def recommendation(title, rank=1):
-    return dict(title=title, kind='feature', priority_rank=rank, priority_reason='User value',
+def recommendation(title, rank=1, category='Feature'):
+    return dict(title=title, category=category, kind='feature' if category == 'Feature' else 'improvement', priority_rank=rank, priority_reason='User value',
                 business_value='Improve user workflow', current_behavior='Missing feature',
                 desired_behavior='Feature works', evidence=['README.md:1'],
                 acceptance_criteria=['Feature runs'], implementation=['Implement and test'],
@@ -132,6 +132,9 @@ class FakeAgent:
             {'name': 'runtime', 'kind': 'runtime', 'argv': [sys.executable, '-c', 'print("runtime")']}], 'reason': 'fixture'}
 
     def recommend(self, context, backlog, priorities, cwd):
+        if (backlog.get('requested_categories') not in (None, ['UI', 'Feature', 'UX'])
+                or backlog.get('duplicate_recommendations')):
+            return {'recommendations': [], 'notes': ''}
         self.contexts.append(context['commit'])
         self.calls += 1
         return {'recommendations': [recommendation('Older feature', 1), recommendation('First feature', 0)] if self.calls == 1
@@ -174,6 +177,51 @@ class EngineCase(unittest.TestCase):
 
 
 class EngineTests(EngineCase):
+    def test_complete_batch_is_published_before_approved_work(self):
+        approved = self.jira.add_ticket('Approved work', adf('Scope'))
+        self.jira.approve(approved)
+        result = {'recommendations': [
+            recommendation('Improve visual layout', category='UI'),
+            recommendation('Add a capability', category='Feature'),
+            recommendation('Simplify navigation', category='UX'),
+        ], 'notes': ''}
+        with patch.object(self.agent, 'recommend', return_value=result) as recommend:
+            self.engine.cycle()
+        self.assertEqual(recommend.call_count, 1)
+        self.assertEqual([i['fields']['summary'] for i in self.jira.items[1:]],
+                         ['Improve visual layout', 'Add a capability', 'Simplify navigation'])
+        self.assertEqual(self.jira.completed, [approved])
+
+    def test_resume_reconciles_lost_response_mid_batch(self):
+        result = {'recommendations': [recommendation(category + ' change', category=category)
+                                      for category in ('UI', 'Feature', 'UX')], 'notes': ''}
+        create = self.jira.create
+
+        def lose_second_response(rec, fp, base):
+            if rec['category'] == 'Feature':
+                self.jira.fail_create = True
+            return create(rec, fp, base)
+
+        with patch.object(self.agent, 'recommend', return_value=result) as recommend:
+            with patch.object(self.jira, 'create', side_effect=lose_second_response):
+                with self.assertRaises(TransientError):
+                    self.engine.cycle()
+            self.assertEqual(len(self.jira.items), 2)
+            self.engine.cycle()
+        self.assertEqual(recommend.call_count, 1)
+        self.assertEqual([i['fields']['summary'] for i in self.jira.items],
+                         ['UI change', 'Feature change', 'UX change'])
+
+    def test_legacy_publish_resumes_with_its_original_one_ticket_limit(self):
+        records = {}
+        for fingerprint in ('first', 'second'):
+            rec = recommendation(fingerprint)
+            del rec['category']
+            records[fingerprint] = {'recommendation': rec, 'base': self.repo.head(), 'attempted': False}
+        self.state.set('recommendations', records)
+        self.engine.publish({'fingerprints': ['first', 'second']})
+        self.assertEqual([i['fields']['summary'] for i in self.jira.items], ['first'])
+
     def test_duplicate_batch_retries_with_matching_jira_keys_in_same_cycle(self):
         key = self.jira.add_ticket('Existing feature', adf('Scope'))
         duplicate = {'recommendations': [recommendation('existing  feature')], 'notes': ''}
@@ -195,6 +243,25 @@ class EngineTests(EngineCase):
         self.assertEqual(recommend.call_count, 2)
         self.assertEqual(len(self.jira.items), 1)
 
+    def test_retry_requests_missing_categories_and_rejects_cross_category_duplicates(self):
+        existing = self.jira.add_ticket('Existing work', adf('Scope'))
+        first = {'recommendations': [
+            recommendation('Existing work', category='Feature'),
+            recommendation('Improve spacing', category='UI'),
+        ], 'notes': ''}
+        retry = {'recommendations': [
+            recommendation('Improve spacing', category='UX'),
+            recommendation('Add export', category='Feature'),
+        ], 'notes': ''}
+        with patch.object(self.agent, 'recommend', side_effect=[first, retry]) as recommend:
+            self.engine.cycle()
+        context = recommend.call_args.args[1]
+        self.assertEqual(context['requested_categories'], ['Feature', 'UX'])
+        self.assertEqual(context['accepted_recommendations'], [{'title': 'Improve spacing', 'category': 'UI'}])
+        self.assertEqual(context['duplicate_recommendations'][0]['matching_jira_tickets'], [existing])
+        self.assertEqual([i['fields']['summary'] for i in self.jira.items],
+                         ['Existing work', 'Improve spacing', 'Add export'])
+
     def test_new_ticket_waits_for_jira_approval(self):
         base = self.repo.head()
         self.engine.cycle()
@@ -212,7 +279,7 @@ class EngineTests(EngineCase):
         self.jira.approve('APP-2')
         self.engine.cycle()
         self.assertNotEqual(initial, first)
-        self.assertEqual(self.agent.contexts, [initial, first])
+        self.assertEqual(self.agent.contexts, [initial, initial, first, first])
         self.assertEqual(self.jira.completed, ['APP-1', 'APP-2'])
         self.assertEqual(len(self.jira.items), 2)
         self.assertIsNone(self.state.get('cycle'))
@@ -250,7 +317,7 @@ class EngineTests(EngineCase):
         self.assertEqual(self.jira.blocked, ['APP-1'])
         self.assertTrue(list(self.repo.worktrees.glob('ticket-*')))
 
-    def test_actionable_todo_blocks_creation_and_highest_approved_priority_wins(self):
+    def test_highest_approved_priority_wins_after_creation(self):
         self.jira.add_ticket('Blocked', adf('Scope'), labels=['self-improver-blocked'])
         missing = self.jira.add_ticket('Needs scope', adf(''))
         first = self.jira.add_ticket('Lower priority', adf('Scope'), priority='2')
@@ -263,26 +330,27 @@ class EngineTests(EngineCase):
         self.jira.approve(second)
         self.engine.cycle()
         self.assertEqual(self.jira.completed, [second])
-        self.assertEqual(self.agent.calls, 0)
+        self.assertEqual(self.agent.calls, 1)
 
-    def test_approval_during_recommendation_prevents_creation(self):
+    def test_approval_during_recommendation_allows_creation(self):
         key = self.jira.add_ticket('Manual ticket', adf('Scope'))
         recommend = self.agent.recommend
 
         def concurrent_approval(*args):
-            self.jira.approve(key)
+            if self.jira.issue(key)['fields']['status']['name'] == 'Open':
+                self.jira.approve(key)
             return recommend(*args)
 
         with patch.object(self.agent, 'recommend', side_effect=concurrent_approval):
             self.engine.cycle()
-        self.assertEqual([i['key'] for i in self.jira.items], [key])
+        self.assertEqual([i['key'] for i in self.jira.items], [key, 'APP-2'])
         self.assertEqual(self.jira.completed, [key])
-        self.assertEqual(self.state.get('recommendations'), {})
 
     def test_unapproved_todo_appearing_during_recommendation_allows_creation(self):
         recommend = self.agent.recommend
         def concurrent_todo(*args):
-            self.jira.add_ticket('New manual ticket', adf('Scope'))
+            if not self.jira.items:
+                self.jira.add_ticket('New manual ticket', adf('Scope'))
             return recommend(*args)
         with patch.object(self.agent, 'recommend', side_effect=concurrent_todo):
             self.engine.cycle()
@@ -311,12 +379,13 @@ class EngineTests(EngineCase):
         self.assertEqual(self.jira.comment_items[blocked], [])
         self.assertEqual(self.jira.completed, [])
 
-    def test_failed_todo_search_prevents_creation(self):
-        with patch.object(self.jira, 'ready', side_effect=[[], TransientError('Search unavailable')]):
+    def test_failed_ready_search_resumes_after_publishing(self):
+        with patch.object(self.jira, 'ready', side_effect=TransientError('Search unavailable')):
             with self.assertRaisesRegex(TransientError, 'Search unavailable'):
                 self.engine.cycle()
-        self.assertEqual(self.jira.items, [])
-        self.assertFalse(any(record['attempted'] for record in self.state.get('recommendations').values()))
+        self.assertEqual(len(self.jira.items), 1)
+        self.engine.cycle()
+        self.assertEqual(len(self.jira.items), 1)
 
     def test_multiple_recent_creates_are_checked_during_search_indexing_lag(self):
         manual = self.jira.add_ticket('Indexed manual ticket', adf('Scope'))
@@ -330,19 +399,19 @@ class EngineTests(EngineCase):
             self.engine.cycle()
             self.assertEqual(self.jira.completed, ['APP-2'])
         self.assertEqual(len(self.jira.items), 3)
-        self.assertEqual(self.agent.calls, 2)
+        self.assertEqual(self.agent.calls, 3)
         self.assertEqual(self.jira.comment_items['APP-3'], [])
         self.engine.project_ready()
         self.assertEqual(self.state.get('recent_jira_create'), ['APP-3'])
 
-    def test_failed_approval_lookup_prevents_creation(self):
+    def test_failed_approval_lookup_prevents_implementation(self):
         key = self.jira.add_ticket('Manual ticket', adf('Scope'))
         self.jira.approve(key)
         with patch.object(self.jira, 'changelog', side_effect=TransientError('History unavailable')):
             with self.assertRaisesRegex(TransientError, 'History unavailable'):
                 self.engine.cycle()
-        self.assertEqual([i['key'] for i in self.jira.items], [key])
-        self.assertEqual(self.agent.calls, 0)
+        self.assertEqual([i['key'] for i in self.jira.items], [key, 'APP-2'])
+        self.assertEqual(self.jira.completed, [])
 
     def test_scope_edits_require_fresh_approval_even_when_reverted(self):
         for field in ('summary', 'description'):
