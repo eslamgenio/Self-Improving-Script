@@ -200,7 +200,10 @@ Prioritize product growth and user experience grounded in the documented applica
 critical security/data-loss/correctness issues outrank other work. Defer ambiguous product choices.
 priority_rank indexes the following ordered Jira priority IDs (0 highest): {canonical(priorities)}.
 Evidence must reference existing inventory paths with concrete observations. Compare existing
-backlog AND past outcomes below; avoid reworded duplicates. Use empty dependencies unless
+backlog AND past outcomes below; avoid reworded duplicates.
+If the context lists duplicate_recommendations, use the matching Jira ticket keys to
+exclude that work and suggest different improvements, or return no recommendations.
+Use empty dependencies unless
 the ticket is blocked on explicit unresolved dependencies. Include reproduction for bugs
 in current_behavior, and full migration/rollback implications for breaking changes.
 {self.skills('recommend')}\nCONTEXT {canonical(context)}\nBACKLOG AND HISTORY {canonical(backlog)}'''

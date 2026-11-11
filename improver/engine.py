@@ -198,27 +198,47 @@ class Engine:
         context = self.repo.context()
         backlog = self.jira.issues(project_wide=True)
         records = self.state.get('recommendations', {})
-        result = self.agent.recommend(context, self.backlog_context(backlog, records),
-                                      self.config.jira['priorities'], self.repo.root)
-        recs = validate_recommendations(result, len(self.config.jira['priorities']))
-        titles = {' '.join(r['recommendation']['title'].casefold().split()) for r in records.values()}
-        titles.update(' '.join(i['fields']['summary'].casefold().split()) for i in backlog)
+        backlog_context = self.backlog_context(backlog, records)
+        titles = {}
+        for issue in backlog:
+            title = ' '.join(issue['fields']['summary'].casefold().split())
+            titles.setdefault(title, set()).add(issue['key'])
+        for record in records.values():
+            title = ' '.join(record['recommendation']['title'].casefold().split())
+            keys = titles.setdefault(title, set())
+            if record.get('key'):
+                keys.add(record['key'])
+
         fingerprints = []
-        for rec in sorted(recs, key=lambda rec: rec['priority_rank']):
-            title = ' '.join(rec['title'].casefold().split())
-            # Line-number movement must not make an otherwise identical recommendation new.
-            evidence_tokens = re.sub(r':\d+(?:[-:]\d+)?', '', rec['evidence'][0]).split()
-            evidence = evidence_tokens[0] if evidence_tokens else ''
-            fingerprint = recommendation_id(title, evidence)
-            if title in titles or fingerprint in records:
-                continue
-            # Require evidence grounded in at least one inventoried source path.
-            if not any(any(path in entry for path in context['files']) for entry in rec['evidence']):
-                raise Blocked(f'Recommendation has no source evidence: {rec["title"]}')
-            records[fingerprint] = {'recommendation': rec, 'base': context['commit'],
-                                    'attempted': False, 'sequence': len(records)}
-            fingerprints.append(fingerprint)
-            break
+        for attempt in range(2):
+            result = self.agent.recommend(context, backlog_context, self.config.jira['priorities'], self.repo.root)
+            recs = validate_recommendations(result, len(self.config.jira['priorities']))
+            duplicates = []
+            for rec in sorted(recs, key=lambda rec: rec['priority_rank']):
+                title = ' '.join(rec['title'].casefold().split())
+                # Line-number movement must not make an otherwise identical recommendation new.
+                evidence_tokens = re.sub(r':\d+(?:[-:]\d+)?', '', rec['evidence'][0]).split()
+                evidence = evidence_tokens[0] if evidence_tokens else ''
+                fingerprint = recommendation_id(title, evidence)
+                if title in titles or fingerprint in records:
+                    keys = set(titles.get(title, ()))
+                    if records.get(fingerprint, {}).get('key'):
+                        keys.add(records[fingerprint]['key'])
+                    duplicates.append({'title': rec['title'], 'matching_jira_tickets': sorted(keys)})
+                    continue
+                if not any(any(path in entry for path in context['files']) for entry in rec['evidence']):
+                    raise Blocked(f'Recommendation has no source evidence: {rec["title"]}')
+                records[fingerprint] = {'recommendation': rec, 'base': context['commit'],
+                                        'attempted': False, 'sequence': len(records)}
+                fingerprints.append(fingerprint)
+                break
+            if fingerprints or not duplicates or attempt == 1 or self.approved_ticket(reset_stale=False)[0]:
+                break
+            matches = sorted({key for duplicate in duplicates for key in duplicate['matching_jira_tickets']})
+            match_text = ', '.join(matches) if matches else 'local recommendation history'
+            print(f'All recommendations matched existing work ({match_text}). Asking Codex for alternatives.',
+                  flush=True)
+            backlog_context = {**backlog_context, 'duplicate_recommendations': duplicates}
         cycle = {'id': uuid.uuid4().hex[:12], 'base': context['commit'], 'fingerprints': fingerprints}
         # Recommendations and the publish checkpoint must become durable together.
         cycle['phase'] = 'publish'

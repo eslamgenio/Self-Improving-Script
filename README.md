@@ -193,6 +193,13 @@ and tickets assigned to another application. When no ticket qualifies, it can
 create one To Do ticket per cycle and checks the ready queue again just before
 creating it.
 
+If every recommendation matches existing work, the controller gives Codex the
+matching Jira ticket keys and asks once for different suggestions in the same
+cycle. If the retry yields no new candidate, the cycle publishes nothing.
+For example, if a suggestion matches SCRUM-11, the launcher reports that match
+before asking Codex for alternatives. The one-ticket limit still applies if the
+retry returns several new suggestions.
+
 1. Open a To Do ticket and write the scope and acceptance criteria in the
    description. Review the title and description, then move the ticket to
    **Ready for Automation**. Move it back to **To Do** to withdraw approval.

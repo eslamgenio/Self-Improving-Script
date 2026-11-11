@@ -174,6 +174,27 @@ class EngineCase(unittest.TestCase):
 
 
 class EngineTests(EngineCase):
+    def test_duplicate_batch_retries_with_matching_jira_keys_in_same_cycle(self):
+        key = self.jira.add_ticket('Existing feature', adf('Scope'))
+        duplicate = {'recommendations': [recommendation('existing  feature')], 'notes': ''}
+        fresh = {'recommendations': [recommendation('New feature'), recommendation('Another feature')], 'notes': ''}
+        with patch.object(self.agent, 'recommend', side_effect=[duplicate, fresh]) as recommend:
+            self.engine.cycle()
+        self.assertEqual(recommend.call_count, 2)
+        self.assertEqual(recommend.call_args.args[1]['duplicate_recommendations'], [
+            {'title': 'existing  feature', 'matching_jira_tickets': [key]},
+        ])
+        self.assertEqual([issue['fields']['summary'] for issue in self.jira.items],
+                         ['Existing feature', 'New feature'])
+
+    def test_duplicate_retry_does_not_loop_or_publish_a_duplicate(self):
+        self.jira.add_ticket('Existing feature', adf('Scope'))
+        result = {'recommendations': [recommendation('Existing feature')], 'notes': ''}
+        with patch.object(self.agent, 'recommend', return_value=result) as recommend:
+            self.engine.cycle()
+        self.assertEqual(recommend.call_count, 2)
+        self.assertEqual(len(self.jira.items), 1)
+
     def test_new_ticket_waits_for_jira_approval(self):
         base = self.repo.head()
         self.engine.cycle()
