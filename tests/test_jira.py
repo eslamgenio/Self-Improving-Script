@@ -1,0 +1,61 @@
+import unittest
+from improver.core import Config, ConfigError, TransientError
+from improver.jira import Jira, adf, issue_description
+
+
+class FakeTransport:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def __call__(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        return next(self.responses)
+
+
+class JiraTests(unittest.TestCase):
+    def test_search_paginates_and_is_application_scoped(self):
+        transport = FakeTransport([{'issues': [{'key': 'X-1'}], 'nextPageToken': 'next'},
+                                   {'issues': [{'key': 'X-2'}], 'isLast': True}])
+        client = Jira(Config(app_id='demo', jira={'project': 'X'}), transport=transport)
+        self.assertEqual([i['key'] for i in client.issues()], ['X-1', 'X-2'])
+        self.assertIn('self-improver-app-demo', transport.calls[0][2]['jql'])
+        self.assertEqual(transport.calls[1][2]['nextPageToken'], 'next')
+
+    def test_selection_respects_jira_priority_and_age(self):
+        client = Jira(Config(jira={'priorities': ['100', '7']}), transport=lambda *a: None)
+        def issue(key, priority, age, labels=()):
+            return {'key': key, 'fields': {'priority': {'id': priority}, 'created': age,
+                    'labels': list(labels), 'status': {'statusCategory': {'key': 'new'}}}}
+        items = [issue('X-1', '7', '2020'), issue('X-2', '100', '2022'),
+                 issue('X-3', '100', '2021'), issue('X-4', '100', '2019', ['self-improver-blocked'])]
+        self.assertEqual(client.select(items)['key'], 'X-3')
+
+    def test_transition_resolves_current_transition_id(self):
+        transport = FakeTransport([{'fields': {'status': {'name': 'Open'}}},
+                                   {'transitions': [{'id': '42', 'to': {'name': 'Done'}, 'fields': {}}]}, {}])
+        client = Jira(Config(), transport=transport)
+        client.transition('X-1', 'Done')
+        self.assertEqual(transport.calls[-1][2], {'transition': {'id': '42'}})
+
+    def test_adf_preserves_multiline_text(self):
+        doc = adf('a\nb')
+        self.assertEqual(doc['type'], 'doc')
+        self.assertEqual(len(doc['content']), 2)
+
+    def test_creation_has_identity_priority_custom_fields_and_adf(self):
+        cfg = Config(app_id='demo', jira={'project': 'X', 'priorities': ['1'],
+                     'issue_types': {'feature': '10'}, 'custom_fields': {'customfield_1': 'team'}})
+        transport = FakeTransport([{'key': 'X-1'}])
+        client = Jira(cfg, transport=transport)
+        rec = {'title': 'Search', 'kind': 'feature', 'priority_rank': 0, 'evidence': ['app.py:1']}
+        client.create(rec, 'abc', 'commit')
+        fields = transport.calls[0][2]['fields']
+        self.assertEqual(fields['priority']['id'], '1')
+        self.assertEqual(fields['customfield_1'], 'team')
+        self.assertEqual(fields['description']['type'], 'doc')
+        self.assertIn('self-improver-fp-abc', fields['labels'])
+
+
+if __name__ == '__main__':
+    unittest.main()

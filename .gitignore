@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.env*
+.coverage
+/setup-scrum.json
+/setup-scrum-*.tmp
