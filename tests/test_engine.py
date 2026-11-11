@@ -219,13 +219,13 @@ class EngineTests(EngineCase):
         self.assertEqual(self.jira.blocked, ['APP-1'])
         self.assertTrue(list(self.repo.worktrees.glob('ticket-*')))
 
-    def test_manual_todo_blocks_creation_and_highest_approved_priority_wins(self):
+    def test_actionable_todo_blocks_creation_and_highest_approved_priority_wins(self):
         self.jira.add_ticket('Blocked', adf('Scope'), labels=['self-improver-blocked'])
         missing = self.jira.add_ticket('Needs scope', adf(''))
         first = self.jira.add_ticket('Lower priority', adf('Scope'), priority='2')
         second = self.jira.add_ticket('Higher priority', adf('Scope'))
-        self.engine.cycle()
-        self.assertIn(f'{missing} waiting for a description', self.state.get('last_cycle')['reason'])
+        _, _, waiting = self.engine.approved_ticket()
+        self.assertIn(f'{missing} waiting for a description', waiting)
         self.assertEqual(self.jira.comment_items[missing], [])
         self.jira.approve(first)
         self.jira.approve(second)
@@ -233,15 +233,51 @@ class EngineTests(EngineCase):
         self.assertEqual(self.jira.completed, [second])
         self.assertEqual(self.agent.calls, 0)
 
-    def test_todo_appearing_during_recommendation_prevents_creation(self):
+    def test_approval_during_recommendation_prevents_creation(self):
+        key = self.jira.add_ticket('Manual ticket', adf('Scope'))
+        recommend = self.agent.recommend
+
+        def concurrent_approval(*args):
+            self.jira.approve(key)
+            return recommend(*args)
+
+        with patch.object(self.agent, 'recommend', side_effect=concurrent_approval):
+            self.engine.cycle()
+        self.assertEqual([i['key'] for i in self.jira.items], [key])
+        self.assertEqual(self.jira.completed, [key])
+        self.assertEqual(self.state.get('recommendations'), {})
+
+    def test_unapproved_todo_appearing_during_recommendation_allows_creation(self):
         recommend = self.agent.recommend
         def concurrent_todo(*args):
             self.jira.add_ticket('New manual ticket', adf('Scope'))
             return recommend(*args)
         with patch.object(self.agent, 'recommend', side_effect=concurrent_todo):
             self.engine.cycle()
-        self.assertEqual([i['fields']['summary'] for i in self.jira.items], ['New manual ticket'])
-        self.assertEqual(self.state.get('recommendations'), {})
+        self.assertEqual([i['fields']['summary'] for i in self.jira.items], ['New manual ticket', 'First feature'])
+        self.assertEqual([len(self.jira.comment_items[key]) for key in ('APP-1', 'APP-2')], [1, 1])
+        self.assertEqual(self.jira.completed, [])
+
+    def test_blocked_stale_and_ineligible_todo_allow_creation(self):
+        blocked = self.jira.add_ticket('Approved then blocked', adf('Scope'))
+        stale = self.jira.add_ticket('Changed scope', adf('Scope'))
+        unmapped = self.jira.add_ticket('Unknown priority', adf('Scope'))
+        foreign = self.jira.add_ticket('Other app', adf('Scope'))
+        self.engine.approved_ticket()
+        for key in (blocked, stale, unmapped, foreign):
+            self.jira.approve(key)
+        self.jira.issue(blocked)['fields']['labels'].append('self-improver-blocked')
+        self.jira.scope_edits[stale] = 'edited'
+        self.jira.issue(unmapped)['fields']['priority']['id'] = 'unmapped'
+        self.jira.issue(foreign)['fields']['labels'].append('self-improver-app-other')
+
+        self.engine.cycle()
+
+        self.assertEqual(self.jira.items[-1]['fields']['summary'], 'First feature')
+        self.assertEqual(len(self.jira.items), 5)
+        self.assertEqual(len(self.jira.comment_items[stale]), 3)
+        self.assertEqual(len(self.jira.comment_items[blocked]), 2)
+        self.assertEqual(self.jira.completed, [])
 
     def test_failed_todo_search_prevents_creation(self):
         with patch.object(self.jira, 'todo', side_effect=[[], TransientError('Search unavailable')]):
@@ -250,13 +286,30 @@ class EngineTests(EngineCase):
         self.assertEqual(self.jira.items, [])
         self.assertFalse(any(record['attempted'] for record in self.state.get('recommendations').values()))
 
-    def test_recent_create_is_checked_during_search_indexing_lag(self):
-        self.engine.cycle()
-        with patch.object(self.jira, 'todo', return_value=[]):
+    def test_multiple_recent_creates_are_checked_during_search_indexing_lag(self):
+        manual = self.jira.add_ticket('Indexed manual ticket', adf('Scope'))
+        with patch.object(self.jira, 'todo', return_value=[self.jira.issue(manual)]):
             self.engine.cycle()
-        self.assertEqual(len(self.jira.items), 1)
-        self.assertEqual(self.agent.calls, 1)
-        self.assertEqual(len(self.jira.comment_items['APP-1']), 1)
+            self.assertEqual(self.state.get('recent_jira_create'), ['APP-2'])
+            self.state.set('recent_jira_create', 'APP-2')  # State written by older releases.
+            self.engine.cycle()
+            self.assertEqual(self.state.get('recent_jira_create'), ['APP-2', 'APP-3'])
+            self.jira.approve('APP-2')
+            self.engine.cycle()
+            self.assertEqual(self.jira.completed, ['APP-2'])
+        self.assertEqual(len(self.jira.items), 3)
+        self.assertEqual(self.agent.calls, 2)
+        self.assertEqual(len(self.jira.comment_items['APP-3']), 1)
+        self.engine.project_todo()
+        self.assertEqual(self.state.get('recent_jira_create'), [])
+
+    def test_failed_approval_lookup_prevents_creation(self):
+        key = self.jira.add_ticket('Manual ticket', adf('Scope'))
+        with patch.object(self.jira, 'comments', side_effect=TransientError('Comments unavailable')):
+            with self.assertRaisesRegex(TransientError, 'Comments unavailable'):
+                self.engine.cycle()
+        self.assertEqual([i['key'] for i in self.jira.items], [key])
+        self.assertEqual(self.agent.calls, 0)
 
     def test_wrong_account_and_stale_revision_do_not_authorize_work(self):
         key = self.jira.add_ticket('Manual', adf('First scope'))

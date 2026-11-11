@@ -1,9 +1,9 @@
 # Application Self-Improver
 
 A Python controller that reviews an application's source with Codex CLI, creates
-a Jira Cloud backlog ticket when To Do is empty, and implements the highest-priority
-approved ticket in a Git worktree. It verifies the change and fast-forwards the
-local target branch.
+a Jira Cloud backlog ticket when no approved To Do ticket is ready to work on,
+and implements the highest-priority eligible ticket in a Git worktree. It verifies
+the change and fast-forwards the local target branch.
 It repeats five minutes after each cycle until you press Ctrl+C.
 
 Product growth and user experience guide recommendations. Critical security,
@@ -31,11 +31,10 @@ uses the account/model configured in your CLI and is subject to its usage limits
 
 ## Set up the SCRUM application on another Windows machine
 
-`setup-scrum.ps1` defaults to `https://ishussien.atlassian.net`, Jira project
-`SCRUM`, and board `1`. To configure a Jira target, set `jira_url`, `jira_project`,
-and `jira_board_id` in `setup-scrum.json`. Use the
-[direct CLI instructions](#start-from-an-application-directory) if the target
-needs different issue type, priority, or status mappings.
+Set `jira_url`, `jira_project`, and `jira_board_id` in `setup-scrum.json` to
+select the Jira target. Use the `jira` object in that file to set issue type
+IDs, priority IDs, workflow statuses, and any required custom or transition
+fields.
 
 Clone this tool and the application repository. Keep the application's `main`
 branch clean and checked out. Have Python 3.12, Git, a signed-in Codex CLI, and
@@ -47,46 +46,66 @@ From the tool folder, run:
 .\setup-scrum.ps1
 ```
 
-The launcher uses `setup-scrum.json` for the application path, Jira target,
-credentials, and agent-skills commit. Its `doctor` and `run` commands load
-settings from this file. The application repository stores runtime state per
-Jira target under its Git metadata. Direct CLI runs use their own configuration
-and state, so prior direct CLI checkpoints stay with that workflow.
+`setup-scrum.ps1` and `self_improve.py` both use the adjacent `setup-scrum.json`
+for the application path, Jira target, credentials, and agent-skills commit.
+They share runtime state for that Jira target under the application's Git
+metadata. To select a different settings file, pass `--launcher-settings`.
 
-On a fresh clone, you can create `setup-scrum.json` beside `setup-scrum.ps1`
-before running the launcher. For example, this file sets the Jira target and
-lets the launcher obtain the application path and credentials from its usual
-fallbacks or prompts.
+Create `setup-scrum.json` beside `setup-scrum.ps1` before running setup if you
+want to fill in the values yourself. This example uses the previous SCRUM
+settings. Use the application path and Jira mappings for your installation.
 
 ```json
 {
+  "application_path": "C:/Eslam/2- Areas/Projects/Self-Improving App",
   "jira_url": "https://ishussien.atlassian.net",
   "jira_project": "SCRUM",
-  "jira_board_id": 1
+  "jira_board_id": 1,
+  "jira_email": "your-atlassian-email@example.com",
+  "jira_api_token": "",
+  "jira": {
+    "issue_types": {"bug": "10003", "improvement": "10003", "feature": "10004"},
+    "priorities": ["1", "2", "3", "4", "5"],
+    "statuses": {"backlog": "To Do", "in_progress": "In Progress", "done": "Done"}
+  }
 }
 ```
 
-After `doctor` passes, the launcher saves all settings to that file. Choose `3`
-if you only want to finish setup. Older settings files use the same defaults
-for missing Jira target fields and gain those fields after a successful `doctor`.
+Use an absolute application path with forward slashes or doubled backslashes
+in JSON. Enter your Atlassian sign-in email and leave `jira_api_token` blank if
+you want to enter it at the masked prompt. The saved token is plain text, and
+`.gitignore` excludes the file from Git. Keep the file private.
 
-For later runs, edit `application_path`, `jira_email`, and `jira_api_token` in
-that file. Use an absolute path with forward slashes or doubled backslashes in
-JSON. The token is stored in plain text, and `.gitignore` excludes the file from
-Git. Keep it private. The token prompt masks input.
-
-If the saved path is blank, the launcher prompts for the application repository.
-Jira credentials in `setup-scrum.json` take precedence over PowerShell environment
-variables. The launcher uses a token with an associated email only when that
-email matches the selected account. It prompts for any values still missing
-after these fallbacks and restores your previous Jira environment variables when
-it exits.
+List priority IDs from highest to lowest. If Jira requires custom fields or
+transition fields, add `custom_fields` or `transition_fields` inside `jira`.
+After `doctor` passes, the launcher saves the settings and records
+`skills_commit` automatically.
 
 After `doctor` passes and settings are saved, press Enter or choose `1` to run
 one cycle. Choose `2` to run continuously and press Ctrl+C to stop, or choose `3`
 to exit without starting a cycle.
 
-## Start from an application directory
+You can also run the workflow directly from the tool folder. In an interactive
+terminal, `init`, `doctor`, and `run` read `setup-scrum.json` and prompt for
+missing application and Jira settings. The token prompt masks input.
+`init` validates and saves the launcher settings locally. `doctor` and `run`
+save prompted values after `doctor` passes, before starting any cycle.
+
+```powershell
+py -3.12 .\self_improve.py init
+py -3.12 .\self_improve.py doctor
+py -3.12 .\self_improve.py run --once
+py -3.12 .\self_improve.py status
+```
+
+Pass `--repo` before the command to override the saved application path.
+For unattended runs, fill in `setup-scrum.json` first.
+
+## Use an application repository configuration
+
+Pass `--repo-settings` before commands such as `doctor`, `run`, or `status` to
+use the application repository configuration. The installed `self-improve`
+command also uses that configuration by default.
 
 Keep this tool outside the application you are improving. From PowerShell:
 
@@ -94,15 +113,17 @@ Keep this tool outside the application you are improving. From PowerShell:
 $tool = 'C:\Eslam\2- Areas\Projects\Self-Improving Script\self_improve.py'
 Set-Location 'C:\path\to\your-application'
 
-py -3 $tool init --app-id my-app `
+py -3.12 $tool --repo-settings init --app-id my-app `
   --jira-url 'https://YOUR-SITE.atlassian.net' `
   --project APP --board-id 123 `
   --priority-ids '1,2,3,4,5' `
-  --bug-type '10004' --improvement-type '10002' --feature-type '10001'
+  --bug-type '10004' --improvement-type '10002' --feature-type '10001' `
+  --backlog-status 'To Do' --progress-status 'In Progress' --done-status 'Done'
 ```
 
 **The IDs above are examples, not universal Jira defaults.** Use your instance's
-actual IDs, with priorities ordered highest first. `init` clones the official
+actual IDs, with priorities ordered highest first. Omit a Jira option to enter
+its value interactively. Repository-mode `init` clones the official
 [agent-skills repository](https://github.com/addyosmani/agent-skills), resolves a
 commit, checks out that commit, and saves its hash. Future runs never silently
 update the skills. `--skills-revision <sha>` pins an explicit revision;
@@ -142,7 +163,8 @@ Find project-specific IDs through Jira administration or these read-only APIs:
 - `/rest/api/3/project/APP/statuses` — workflow status names by issue type.
 - `/rest/agile/1.0/board` — boards visible to your account.
 
-Provide credentials in the current process environment, not in files or CLI arguments:
+For the application repository configuration, supply Jira credentials through
+the current process environment.
 
 ```powershell
 $env:JIRA_EMAIL = Read-Host 'Atlassian email'
@@ -162,16 +184,14 @@ Alternatively pass the application directory before the command:
 Optional installation, from this tool's directory: `py -3 -m pip install .`.
 The installed command is `self-improve`, with the same arguments.
 
-To inspect state or resolve pending operations from the PowerShell launcher,
-include `--launcher-settings` before the command. For example, from the tool's
-directory run `py -3.12 self_improve.py --repo 'C:\path\to\application' --launcher-settings setup-scrum.json status`.
-
 ## Collaborate on Jira tickets
 
-Any visible issue in the configured project's To Do status pauses ticket creation.
-This includes manual, blocked, and unapproved tickets. When To Do is empty, the
-controller can create one ticket after checking the backlog again. Jira search
-can take time to reflect newly added issues.
+An approved To Do ticket pauses creation if the controller can work on it.
+The ticket needs a description, a mapped priority, and approval for its current
+scope. Tickets labeled `self-improver-blocked` and tickets assigned to another
+application are excluded. When no ticket qualifies, the controller can create
+one ticket per cycle and checks again just before creating it. Several tickets
+can wait in To Do for approval at the same time.
 
 1. Create a ticket in To Do or open one the controller created. Write the scope
    and acceptance criteria in the description. The controller waits when the

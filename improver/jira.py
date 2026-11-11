@@ -100,7 +100,7 @@ class Jira:
         base = self.base_url()
         email, token = os.environ.get('JIRA_EMAIL'), os.environ.get('JIRA_API_TOKEN')
         if not email or not token:
-            raise ConfigError('Set JIRA_EMAIL and JIRA_API_TOKEN in the environment.')
+            raise ConfigError('Set jira_email and jira_api_token in setup-scrum.json. For repository settings, set JIRA_EMAIL and JIRA_API_TOKEN in the environment.')
         auth = base64.b64encode(f'{email}:{token}'.encode()).decode()
         request = Request(base + path, method=method,
                           data=canonical(body).encode() if body is not None else None,
@@ -193,11 +193,11 @@ class Jira:
 
     def add_comment(self, key, text, marker):
         self.request('POST', f'/rest/api/3/issue/{key}/comment',
-                     {'body': adf(text), 'properties': [{'key': COMMENT_MARKER, 'value': marker}]})
+                     {'body': adf(text), 'properties': [{'key': COMMENT_MARKER, 'value': {'marker': marker}}]})
 
     def comment_exists(self, comments, marker):
         return any(comment.get('author', {}).get('accountId') == self.account_id()
-                   and any(prop['key'] == COMMENT_MARKER and prop['value'] == marker
+                   and any(prop['key'] == COMMENT_MARKER and prop['value'] in (marker, {'marker': marker})
                            for prop in comment.get('properties', [])) for comment in comments)
 
     def approval(self, comments, revision):

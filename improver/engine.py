@@ -130,17 +130,29 @@ class Engine:
     def is_todo(self, ticket):
         return ticket['fields']['status']['name'] == self.config.jira['statuses']['backlog']
 
-    def project_todo(self):
-        issues = self.jira.todo()
+    def recent_jira_creates(self):
         recent = self.state.get('recent_jira_create')
-        if not issues and recent:
+        if isinstance(recent, str):
+            return [recent]
+        return recent or []
+
+    def project_todo(self):
+        issues = list(self.jira.todo())
+        indexed = {ticket['key'] for ticket in issues}
+        recent = self.recent_jira_creates()
+        unindexed = []
+        for key in recent:
+            if key in indexed:
+                continue
             try:
-                ticket = self.jira.issue(recent)
-                if ticket['key'] == recent and self.is_todo(ticket):
-                    return [ticket]
+                ticket = self.jira.issue(key)
             except JiraNotFound:
-                pass
-            self.state.set('recent_jira_create', None)
+                continue
+            if ticket['key'] == key and self.is_todo(ticket):
+                issues.append(ticket)
+                unindexed.append(key)
+        if unindexed != recent:
+            self.state.set('recent_jira_create', unindexed)
         return issues
 
     def publish(self, cycle):
@@ -159,8 +171,8 @@ class Engine:
                             'No create retry will be made. Check Jira, then use resolve-create.', 60)
                     record['key'] = matches[0]['key']
                 else:
-                    if created or self.project_todo():
-                        # A later empty backlog can reconsider recommendations that were never submitted.
+                    if created or self.approved_ticket(request_approval=False)[0]:
+                        # A later cycle can reconsider recommendations that were never submitted.
                         records.pop(fingerprint)
                         self.state.set('recommendations', records)
                         continue
@@ -173,13 +185,14 @@ class Engine:
                         record['attempted'] = False
                         self.state.set('recommendations', records)
                         raise
-                self.state.set_many({'recommendations': records, 'recent_jira_create': record['key']})
+                recent = list(dict.fromkeys([*self.recent_jira_creates(), record['key']]))
+                self.state.set_many({'recommendations': records, 'recent_jira_create': recent})
             created = True
             self.state.enqueue(f'backlog:{record["key"]}', {'kind': 'backlog', 'key': record['key']})
         self.flush()
 
     def new_cycle(self):
-        if self.project_todo():
+        if self.approved_ticket()[0]:
             cycle = {'id': uuid.uuid4().hex[:12], 'base': self.repo.head()}
             self.checkpoint(cycle, 'select')
             return cycle
@@ -230,7 +243,7 @@ class Engine:
         return BLOCKED_LABEL not in labels and all(
             label == self.jira.label for label in labels if label.startswith('self-improver-app-'))
 
-    def approved_ticket(self):
+    def approved_ticket(self, *, request_approval=True):
         approved, approvals, waiting = [], {}, []
         for match in self.project_todo():
             try:
@@ -254,11 +267,13 @@ class Engine:
                         approvals[key] = {'revision': revision, 'comment': approval}
                         approved.append(ticket)
                         continue
-                self.state.enqueue(identity, {'kind': 'scope', 'key': key, 'revision': revision})
-                waiting.append(f'{key} waiting for approval')
+                if request_approval:
+                    self.state.enqueue(identity, {'kind': 'scope', 'key': key, 'revision': revision})
+                    waiting.append(f'{key} waiting for approval')
             except JiraNotFound:
                 continue
-        self.flush()
+        if request_approval:
+            self.flush()
         selected = self.jira.select(approved)
         return selected, approvals.get(selected['key']) if selected else None, waiting
 

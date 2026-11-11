@@ -1,6 +1,6 @@
 import unittest
 from improver.core import Config, ConfigError, TransientError
-from improver.jira import Jira, adf, issue_description
+from improver.jira import COMMENT_MARKER, Jira, adf, issue_description
 
 
 class FakeTransport:
@@ -14,6 +14,18 @@ class FakeTransport:
 
 
 class JiraTests(unittest.TestCase):
+    def test_comment_marker_uses_a_json_object_and_recognizes_legacy_strings(self):
+        transport = FakeTransport([{}, {'accountId': 'operator'}])
+        client = Jira(Config(), transport=transport)
+        marker = 'demo:approval:X-1:revision'
+        client.add_comment('X-1', 'Approve the scope', marker)
+        properties = transport.calls[0][2]['properties']
+        self.assertEqual(properties, [{'key': COMMENT_MARKER, 'value': {'marker': marker}}])
+        comment = {'author': {'accountId': 'operator'}, 'properties': properties}
+        self.assertTrue(client.comment_exists([comment], marker))
+        comment['properties'] = [{'key': COMMENT_MARKER, 'value': marker}]
+        self.assertTrue(client.comment_exists([comment], marker))
+
     def test_todo_query_is_project_wide_even_for_manually_created_issues(self):
         transport = FakeTransport([{'issues': [{'key': 'X-1'}], 'isLast': True}])
         client = Jira(Config(jira={'project': 'X', 'statuses': {'backlog': 'To Do'}}), transport=transport)

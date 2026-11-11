@@ -75,6 +75,124 @@ class ProcessTests(unittest.TestCase):
 
 
 class PinAndCliTests(unittest.TestCase):
+    jira_mappings = {
+        'issue_types': {'bug': '41', 'improvement': '42', 'feature': '43'},
+        'statuses': {'backlog': 'Ready', 'in_progress': 'Working', 'done': 'Closed'},
+        'priorities': ['7', '6'],
+    }
+
+    def test_launcher_init_creates_and_completes_settings_without_opening_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            path = root / 'setup-scrum.json'
+            complete = {'application_path': str(root.resolve()), 'jira_url': 'https://fixture.invalid',
+                        'jira_project': 'DEMO', 'jira_board_id': 82, 'jira': self.jira_mappings,
+                        'jira_email': 'saved@example.invalid', 'jira_api_token': 'fixture-secret'}
+            cases = [
+                (None, [str(root), complete['jira_url'], 'DEMO', '82', '41', '42', '43',
+                        'Ready', 'Working', 'Closed', '7,6', complete['jira_email']], 1, {}),
+                ({**complete, 'jira': {**self.jira_mappings, 'priorities': []}, 'jira_api_token': ' ',
+                  'extra': 'keep'}, ['7,6'], 1, {'extra': 'keep'}),
+                (complete, [], 0, {}),
+            ]
+            for initial, answers, token_prompts, extra in cases:
+                with self.subTest(prompts=len(answers)):
+                    if initial is not None:
+                        path.write_text(json.dumps(initial), encoding='utf-8')
+                    with patch('improver.cli.sys.stdin.isatty', return_value=True), \
+                            patch('builtins.input', side_effect=answers) as prompt, \
+                            patch('improver.cli.getpass', return_value='fixture-secret') as secret, \
+                            patch('improver.cli.Repository') as repository, \
+                            patch.object(Jira, 'request') as request, redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(main(['init'], default_settings=path), 0, output.getvalue())
+                    self.assertEqual(prompt.call_count, len(answers))
+                    self.assertEqual(secret.call_count, token_prompts)
+                    if token_prompts:
+                        secret.assert_called_once_with('Jira API token: ')
+                    repository.assert_not_called()
+                    request.assert_not_called()
+                    self.assertNotIn('fixture-secret', output.getvalue())
+                    self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {**complete, **extra})
+            self.assertEqual(list(root.iterdir()), [path])
+
+    def test_launcher_init_preserves_unusable_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'setup-scrum.json'
+            invalid = {'application_path': d, 'jira_url': 'https://fixture.invalid', 'jira_project': 'DEMO',
+                       'jira_board_id': 0, 'jira': self.jira_mappings, 'jira_email': 'saved@example.invalid',
+                       'jira_api_token': 'fixture-secret'}
+            for contents, error in [('{', 'Cannot read launcher settings'), ('{}', 'Set application_path'),
+                                    (json.dumps(invalid), 'jira_board_id must be a positive board ID')]:
+                with self.subTest(error=error):
+                    path.write_text(contents, encoding='utf-8')
+                    with patch('improver.cli.sys.stdin.isatty', return_value=False), \
+                            redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(main(['--launcher-settings', str(path), 'init']), 2)
+                    self.assertIn(error, output.getvalue())
+                    self.assertEqual(path.read_text(encoding='utf-8'), contents)
+
+    def test_blank_launcher_settings_prompt_and_save_only_after_doctor(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'application with spaces'
+            make_repo(root)
+            settings = Path(d) / 'setup-scrum.json'
+            for command, accepted in [('doctor', False), ('doctor', True), ('run', True)]:
+                with self.subTest(command=command, accepted=accepted):
+                    settings.write_bytes(b' \r\n')
+                    args = [command] if command == 'doctor' else ['run', '--once']
+                    def validate(*unused):
+                        self.assertEqual(os.environ['JIRA_EMAIL'], 'saved@example.invalid')
+                        self.assertEqual(os.environ['JIRA_API_TOKEN'], 'fixture-secret')
+                        self.assertEqual(settings.read_bytes(), b' \r\n')
+                        if not accepted:
+                            raise ConfigError('Doctor failed')
+                        return {'jira': 'OK'}
+
+                    with patch.dict(os.environ, {'JIRA_EMAIL': 'env@example.invalid', 'JIRA_API_TOKEN': 'env-token'}), \
+                            patch('improver.cli.sys.stdin.isatty', return_value=True), \
+                            patch('builtins.input', side_effect=[f'"{root}"', 'https://fixture.invalid', 'DEMO', '82',
+                                                                '41', '42', '43', 'Ready', 'Working', 'Closed',
+                                                                '7,6', 'saved@example.invalid']) as prompt, \
+                            patch('improver.cli.getpass', return_value='fixture-secret') as secret, \
+                            patch('improver.cli.prepare_skills', return_value=(str(root), 'a' * 40)), \
+                            patch('improver.cli.codex_command', return_value=[sys.executable]), \
+                            patch('improver.cli.configure_logging'), \
+                            patch('improver.cli.doctor', side_effect=validate) as doctor, \
+                            patch.object(engine_fixtures.Engine, 'cycle') as cycle, \
+                            redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(main(args, default_settings=settings), 0 if accepted else 2)
+                    self.assertEqual(prompt.call_count, 12)
+                    secret.assert_called_once_with('Jira API token: ')
+                    doctor.assert_called_once()
+                    self.assertEqual(cycle.call_count, int(command == 'run'))
+                    self.assertNotIn('fixture-secret', output.getvalue())
+                    if accepted:
+                        saved = json.loads(settings.read_text(encoding='utf-8'))
+                        self.assertEqual(Path(saved['application_path']), root.resolve())
+                        self.assertEqual(saved['jira_email'], 'saved@example.invalid')
+                        self.assertEqual(saved['jira_api_token'], 'fixture-secret')
+                        self.assertEqual((saved['jira_project'], saved['jira_board_id']), ('DEMO', 82))
+                        self.assertEqual(saved['jira'], self.jira_mappings)
+                    else:
+                        self.assertEqual(settings.read_bytes(), b' \r\n')
+
+    def test_direct_script_uses_adjacent_settings_outside_its_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            workspace = Path(d)
+            root = workspace / 'application with spaces'
+            make_repo(root)
+            entrypoint = workspace / 'self_improve.py'
+            source = Path(__file__).resolve().parents[1]
+            entrypoint.write_bytes((source / entrypoint.name).read_bytes())
+            settings = workspace / 'setup-scrum.json'
+            settings.write_text(json.dumps({'application_path': root.name, 'jira_url': 'https://fixture.invalid',
+                                            'jira_project': 'DEMO', 'jira_board_id': 82, 'jira': self.jira_mappings}),
+                                encoding='utf-8-sig')
+            result = subprocess.run([sys.executable, str(entrypoint), 'status'], cwd=workspace.parent,
+                                    env={**os.environ, 'PYTHONPATH': str(source)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), 'No cycles recorded. Run doctor, then run.')
+
     def test_launcher_doctor_uses_only_launcher_settings_and_keeps_targets_separate(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / 'app'
@@ -87,17 +205,26 @@ class PinAndCliTests(unittest.TestCase):
             pin = 'a' * 40
             args = ['--repo', str(root), '--launcher-settings', str(settings), 'doctor']
             for project, board in [('OTHER', 82), ('SCRUM', 1)]:
-                settings.write_text(json.dumps({'jira_url': 'https://fixture.invalid/', 'jira_project': project,
-                                                 'jira_board_id': board, 'jira_api_token': 'fixture-secret'}),
+                settings.write_text(json.dumps({'application_path': str(root), 'jira_url': 'https://fixture.invalid/',
+                                                 'jira_project': project, 'jira_board_id': board, 'jira': self.jira_mappings,
+                                                 'jira_email': 'saved@example.invalid', 'jira_api_token': 'fixture-secret'}),
                                     encoding='utf-8-sig')
+                def verify_credentials(*unused):
+                    self.assertEqual(os.environ['JIRA_EMAIL'], 'saved@example.invalid')
+                    self.assertEqual(os.environ['JIRA_API_TOKEN'], 'fixture-secret')
+                    return {'jira': 'OK'}
                 with patch('improver.cli.prepare_skills', return_value=(str(repo.home / 'agent-skills'), pin)), \
                         patch('improver.cli.codex_command', return_value=[sys.executable]), \
                         patch('improver.cli.configure_logging'), \
-                        patch('improver.cli.doctor', return_value={'jira': 'OK'}) as doctor, \
+                        patch('improver.cli.doctor', side_effect=verify_credentials) as doctor, \
+                        patch.dict(os.environ, {'JIRA_EMAIL': 'prior@example.invalid', 'JIRA_API_TOKEN': 'prior-token'}), \
                         redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(main(args), 0)
+                    self.assertEqual(main(['doctor'], default_settings=settings), 0)
+                    self.assertEqual(os.environ['JIRA_EMAIL'], 'prior@example.invalid')
+                    self.assertEqual(os.environ['JIRA_API_TOKEN'], 'prior-token')
                 cfg = doctor.call_args.args[0]
                 self.assertEqual((cfg.jira['project'], cfg.jira['board_id']), (project, board))
+                self.assertEqual(cfg.jira['issue_types'], self.jira_mappings['issue_types'])
                 self.assertEqual(json.loads(output.getvalue())['launcher_settings'],
                                  {'jira_url': 'https://fixture.invalid', 'jira_project': project,
                                   'jira_board_id': board, 'skills_commit': pin})
@@ -131,10 +258,17 @@ class PinAndCliTests(unittest.TestCase):
             (skills / 'references' / 'definition-of-done.md').write_text('# Definition of Done')
             git(skills, 'add', '.')
             git(skills, 'commit', '-m', 'fixture skills')
-            with patch('improver.cli.codex_command', return_value=[sys.executable]), redirect_stdout(io.StringIO()):
-                self.assertEqual(main(['--repo', str(root), 'init', '--skills-source', str(skills)]), 0)
+            answers = ['https://fixture.invalid', '82', '41', '42', '43', 'Ready', 'Working', 'Closed', '7,6']
+            with patch('improver.cli.codex_command', return_value=[sys.executable]), \
+                    patch('improver.cli.sys.stdin.isatty', return_value=True), \
+                    patch('builtins.input', side_effect=answers) as prompt, redirect_stdout(io.StringIO()):
+                self.assertEqual(main(['--repo-settings', '--repo', str(root), 'init', '--skills-source', str(skills),
+                                       '--project', 'APP'], default_settings=Path(d) / 'setup-scrum.json'), 0)
+            self.assertEqual(prompt.call_count, len(answers))
             repo = Repository(root, Runner())
             cfg = Config.load(repo.home / 'config.json')
+            self.assertEqual(cfg.jira, {**self.jira_mappings, 'project': 'APP', 'board_id': 82,
+                                        'base_url': 'https://fixture.invalid', 'custom_fields': {}})
             self.assertEqual(cfg.skills_commit, git(skills, 'rev-parse', 'HEAD'))
             self.assertNotIn(str(repo.worktrees), str(repo.common))
             agent = Agent(cfg, repo.home, Runner())
